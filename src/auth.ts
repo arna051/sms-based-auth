@@ -26,9 +26,7 @@ const requestCodeSchema = z.object({
   phone: z.string().min(1).max(64),
   purpose: z.enum(AUTH_PURPOSES),
   scope: z.string().min(1).max(128).optional(),
-  actor: z
-    .object({ userId: z.string().min(1), sessionId: z.string().min(1) })
-    .optional(),
+  actorAccessToken: z.string().min(1).max(4096).optional(),
 });
 const verifyCodeSchema = requestCodeSchema.extend({
   code: z.string().regex(/^\d{6,10}$/),
@@ -57,6 +55,10 @@ export interface CreateAuthOptions<
   sms: SmsSender<TAction>;
   smsActions: Record<AuthPurpose, TAction>;
   identities: IdentityProvider<TClaims>;
+  authorizeScope: (
+    scope: string,
+    context?: RequestContext,
+  ) => boolean | Promise<boolean>;
   observer?: Observer;
   clock?: () => Date;
 }
@@ -92,11 +94,12 @@ export function createSmsBasedAuth<
     purpose: AuthPurpose,
     scope: string,
     actorUserId?: string,
+    actorSessionId?: string,
   ) =>
     keyedHash(
       pepper,
       "challenge-key",
-      `${scope}\0${purpose}\0${phone}\0${actorUserId ?? ""}`,
+      `${scope}\0${purpose}\0${phone}\0${actorUserId ?? ""}\0${actorSessionId ?? ""}`,
     );
   const rateKeys = (
     phoneFingerprint: string,
@@ -148,7 +151,11 @@ export function createSmsBasedAuth<
       .setJti(randomId())
       .setIssuedAt(Math.floor(at.getTime() / 1000))
       .setExpirationTime(Math.floor(at.getTime() / 1000) + cfg.accessTtlSeconds)
-      .sign(activeKey.secret);
+      .sign(
+        activeKey.algorithm === "HS256"
+          ? activeKey.secret
+          : activeKey.privateKey,
+      );
   }
   async function tokenPair(
     record: SessionRecord<TClaims>,
@@ -166,27 +173,67 @@ export function createSmsBasedAuth<
     };
   }
 
+  async function verifyAccessToken(
+    token: string,
+    checkSession = true,
+  ): Promise<AuthContext<TClaims>> {
+    try {
+      const header = decodeProtectedHeader(token);
+      if (
+        typeof header.alg !== "string" ||
+        !["HS256", "ES256", "RS256", "EdDSA"].includes(header.alg) ||
+        typeof header.kid !== "string"
+      )
+        throw new Error("invalid protected header");
+      const key = accessKeys.get(header.kid);
+      if (!key) throw new Error("unknown key ID");
+      if (header.alg !== key.algorithm) throw new Error("algorithm mismatch");
+      const verificationKey =
+        key.algorithm === "HS256" ? key.secret : key.publicKey;
+      const verified = await jwtVerify(token, verificationKey, {
+        algorithms: [key.algorithm],
+        issuer: cfg.issuer,
+        audience: cfg.audience,
+        clockTolerance: cfg.clockToleranceSeconds,
+        typ: "JWT",
+      });
+      const parsed = accessClaims.parse(verified.payload);
+      if (checkSession) {
+        const session = await options.sessions.get(parsed.sid);
+        if (
+          !session ||
+          session.status !== "active" ||
+          session.expiresAt <= now() ||
+          session.userId !== parsed.sub
+        )
+          throw new AuthError("SESSION_REVOKED", "Session revoked", 401);
+      }
+      return {
+        userId: parsed.sub,
+        sessionId: parsed.sid,
+        roles: parsed.roles,
+        permissions: parsed.permissions,
+        claims: parsed.claims as TClaims,
+        issuedAt: new Date(parsed.iat * 1000),
+        expiresAt: new Date(parsed.exp * 1000),
+      };
+    } catch (error) {
+      if (error instanceof AuthError) throw error;
+      throw new AuthError("INVALID_TOKEN", "Invalid access token", 401);
+    }
+  }
+
   return {
     async requestCode(raw: {
       phone: string;
       purpose: AuthPurpose;
       scope?: string;
-      actor?: { userId: string; sessionId: string };
+      actorAccessToken?: string;
       context?: RequestContext;
     }) {
       const input = requestCodeSchema.parse(raw);
       const scope = scopeOf(input.scope);
       const phone = normalizeIranianPhone(input.phone);
-      if (
-        (input.purpose === "phone_verification" ||
-          input.purpose === "sensitive_action") &&
-        !input.actor
-      )
-        throw new AuthError(
-          "INVALID_INPUT",
-          "This purpose requires an authenticated actor",
-          400,
-        );
       const at = now();
       const phoneFingerprint = fingerprint(phone);
       await checkRate(
@@ -194,12 +241,37 @@ export function createSmsBasedAuth<
         rateKeys(phoneFingerprint, scope, raw.context),
         at,
       );
+      if (!(await options.authorizeScope(scope, raw.context)))
+        throw new AuthError(
+          "INVALID_INPUT",
+          "Invalid authentication request",
+          400,
+        );
+      const requiresActor =
+        input.purpose === "phone_verification" ||
+        input.purpose === "sensitive_action";
+      if (requiresActor && !input.actorAccessToken)
+        throw new AuthError(
+          "INVALID_INPUT",
+          "This purpose requires an authenticated actor",
+          400,
+        );
+      if (!requiresActor && input.actorAccessToken)
+        throw new AuthError(
+          "INVALID_INPUT",
+          "Actor token is not valid for this purpose",
+          400,
+        );
+      const actor = input.actorAccessToken
+        ? await verifyAccessToken(input.actorAccessToken, true)
+        : undefined;
       const code = generateCode(cfg.codeLength);
       const key = challengeKey(
         phone,
         input.purpose,
         scope,
-        input.actor?.userId,
+        actor?.userId,
+        actor?.sessionId,
       );
       const record: ChallengeRecord = {
         id: randomId(),
@@ -208,7 +280,9 @@ export function createSmsBasedAuth<
         phoneFingerprint,
         purpose: input.purpose,
         scope,
-        ...(input.actor ? { actorUserId: input.actor.userId } : {}),
+        ...(actor
+          ? { actorUserId: actor.userId, actorSessionId: actor.sessionId }
+          : {}),
         codeHash: keyedHash(pepper, `otp:${cfg.pepper.kid}`, `${key}\0${code}`),
         pepperVersion: cfg.pepper.kid,
         state: "dispatching",
@@ -216,6 +290,7 @@ export function createSmsBasedAuth<
         maxAttempts: cfg.maxAttempts,
         createdAt: at,
         expiresAt: new Date(at.getTime() + cfg.challengeTtlMs),
+        cleanupAt: new Date(at.getTime() + cfg.challengeTtlMs + 86_400_000),
         resendAvailableAt: new Date(at.getTime() + cfg.resendCooldownMs),
       };
       const reservation = await options.challenges.reserve(record, at);
@@ -281,22 +356,12 @@ export function createSmsBasedAuth<
       purpose: AuthPurpose;
       code: string;
       scope?: string;
-      actor?: { userId: string; sessionId: string };
+      actorAccessToken?: string;
       context?: RequestContext;
     }): Promise<VerifyCodeResult> {
       const input = verifyCodeSchema.parse(raw);
       const scope = scopeOf(input.scope);
       const phone = normalizeIranianPhone(input.phone);
-      if (
-        (input.purpose === "phone_verification" ||
-          input.purpose === "sensitive_action") &&
-        !input.actor
-      )
-        throw new AuthError(
-          "INVALID_INPUT",
-          "This purpose requires an authenticated actor",
-          400,
-        );
       const at = now();
       const phoneFingerprint = fingerprint(phone);
       await checkRate(
@@ -304,11 +369,36 @@ export function createSmsBasedAuth<
         rateKeys(phoneFingerprint, scope, raw.context),
         at,
       );
+      if (!(await options.authorizeScope(scope, raw.context)))
+        throw new AuthError(
+          "INVALID_INPUT",
+          "Invalid authentication request",
+          400,
+        );
+      const requiresActor =
+        input.purpose === "phone_verification" ||
+        input.purpose === "sensitive_action";
+      if (requiresActor && !input.actorAccessToken)
+        throw new AuthError(
+          "INVALID_INPUT",
+          "This purpose requires an authenticated actor",
+          400,
+        );
+      if (!requiresActor && input.actorAccessToken)
+        throw new AuthError(
+          "INVALID_INPUT",
+          "Actor token is not valid for this purpose",
+          400,
+        );
+      const actor = input.actorAccessToken
+        ? await verifyAccessToken(input.actorAccessToken, true)
+        : undefined;
       const key = challengeKey(
         phone,
         input.purpose,
         scope,
-        input.actor?.userId,
+        actor?.userId,
+        actor?.sessionId,
       );
       const result = await options.challenges.consumeAttempt(
         key,
@@ -340,12 +430,12 @@ export function createSmsBasedAuth<
           occurredAt: at,
           phoneFingerprint,
           purpose: input.purpose,
-          userId: input.actor!.userId,
+          userId: actor!.userId,
         });
         return {
           kind: "challenge_verified",
           purpose: input.purpose,
-          userId: input.actor!.userId,
+          userId: actor!.userId,
         };
       }
       const identity = await options.identities.resolve({
@@ -371,6 +461,7 @@ export function createSmsBasedAuth<
         id: randomId(),
         familyId: randomId(),
         userId: identity.userId,
+        scope,
         refreshHash: keyedHash(pepper, `refresh:${cfg.pepper.kid}`, rawRefresh),
         spentRefreshHashes: [],
         status: "active",
@@ -411,6 +502,19 @@ export function createSmsBasedAuth<
         throw new AuthError("INVALID_TOKEN", "Invalid refresh token", 401);
       const [sessionId, presented] = parts as [string, string];
       const at = now();
+      const currentSession = await options.sessions.get(sessionId);
+      if (!currentSession)
+        throw new AuthError("SESSION_REVOKED", "Session is invalid", 401);
+      if (
+        options.identities.checkEligibility &&
+        !(await options.identities.checkEligibility(
+          currentSession.userId,
+          currentSession.scope,
+        ))
+      ) {
+        await options.sessions.revokeAll(currentSession.userId);
+        throw new AuthError("ACCOUNT_INELIGIBLE", "Session is invalid", 401);
+      }
       await checkRate(
         "refresh",
         [
@@ -447,55 +551,15 @@ export function createSmsBasedAuth<
       return tokenPair(result.record, next, at);
     },
 
-    async verifyAccessToken(
-      token: string,
-      checkSession = true,
-    ): Promise<AuthContext<TClaims>> {
-      try {
-        const header = decodeProtectedHeader(token);
-        if (header.alg !== "HS256" || typeof header.kid !== "string")
-          throw new Error("invalid protected header");
-        const key = accessKeys.get(header.kid);
-        if (!key) throw new Error("unknown key ID");
-        const verified = await jwtVerify(token, key.secret, {
-          algorithms: [key.algorithm],
-          issuer: cfg.issuer,
-          audience: cfg.audience,
-          clockTolerance: cfg.clockToleranceSeconds,
-          typ: "JWT",
-        });
-        const parsed = accessClaims.parse(verified.payload);
-        if (checkSession) {
-          const session = await options.sessions.get(parsed.sid);
-          if (
-            !session ||
-            session.status !== "active" ||
-            session.expiresAt <= now()
-          )
-            throw new AuthError("SESSION_REVOKED", "Session revoked", 401);
-        }
-        return {
-          userId: parsed.sub,
-          sessionId: parsed.sid,
-          roles: parsed.roles,
-          permissions: parsed.permissions,
-          claims: parsed.claims as TClaims,
-          issuedAt: new Date(parsed.iat * 1000),
-          expiresAt: new Date(parsed.exp * 1000),
-        };
-      } catch (error) {
-        if (error instanceof AuthError) throw error;
-        throw new AuthError("INVALID_TOKEN", "Invalid access token", 401);
-      }
-    },
+    verifyAccessToken,
 
-    async listSessions(actor: {
-      userId: string;
-      currentSessionId: string;
+    async listSessions(input: {
+      accessToken: string;
     }): Promise<SessionSummary[]> {
+      const actor = await verifyAccessToken(input.accessToken, true);
       return (await options.sessions.list(actor.userId)).map((session) => ({
         id: session.id,
-        current: session.id === actor.currentSessionId,
+        current: session.id === actor.sessionId,
         status: session.status,
         createdAt: session.createdAt,
         expiresAt: session.expiresAt,
@@ -503,13 +567,9 @@ export function createSmsBasedAuth<
         ...(session.userAgent ? { userAgent: session.userAgent } : {}),
       }));
     },
-    async revokeSession(input: { sessionId: string; actorUserId: string }) {
-      if (
-        !(await options.sessions.revokeOwned(
-          input.sessionId,
-          input.actorUserId,
-        ))
-      )
+    async revokeSession(input: { sessionId: string; accessToken: string }) {
+      const actor = await verifyAccessToken(input.accessToken, true);
+      if (!(await options.sessions.revokeOwned(input.sessionId, actor.userId)))
         throw new AuthError(
           "FORBIDDEN",
           "Session does not belong to the actor",
@@ -519,18 +579,27 @@ export function createSmsBasedAuth<
         type: "session.revoked",
         occurredAt: now(),
         sessionId: input.sessionId,
-        userId: input.actorUserId,
+        userId: actor.userId,
       });
     },
-    async logout(input: { sessionId: string; actorUserId: string }) {
-      return this.revokeSession(input);
+    async logout(input: { accessToken: string }) {
+      const actor = await verifyAccessToken(input.accessToken, true);
+      if (!(await options.sessions.revokeOwned(actor.sessionId, actor.userId)))
+        throw new AuthError("SESSION_REVOKED", "Session is invalid", 401);
+      await safelyObserve(options.observer, {
+        type: "session.revoked",
+        occurredAt: now(),
+        sessionId: actor.sessionId,
+        userId: actor.userId,
+      });
     },
-    async revokeAllSessions(input: { actorUserId: string }) {
-      const count = await options.sessions.revokeAll(input.actorUserId);
+    async revokeAllSessions(input: { accessToken: string }) {
+      const actor = await verifyAccessToken(input.accessToken, true);
+      const count = await options.sessions.revokeAll(actor.userId);
       await safelyObserve(options.observer, {
         type: "session.all_revoked",
         occurredAt: now(),
-        userId: input.actorUserId,
+        userId: actor.userId,
         metadata: { count },
       });
       return count;

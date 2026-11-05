@@ -42,12 +42,14 @@ export interface ChallengeRecord {
   purpose: AuthPurpose;
   scope: string;
   actorUserId?: string;
+  actorSessionId?: string;
   codeHash: string;
   pepperVersion: string;
   state: ChallengeState;
   attempts: number;
   maxAttempts: number;
   expiresAt: Date;
+  cleanupAt: Date;
   resendAvailableAt: Date;
   createdAt: Date;
 }
@@ -74,6 +76,7 @@ export interface SessionRecord<
   id: string;
   familyId: string;
   userId: string;
+  scope: string;
   refreshHash: string;
   spentRefreshHashes: string[];
   status: SessionStatus;
@@ -135,6 +138,7 @@ export interface IdentityProvider<TClaims extends Record<string, unknown>> {
     scope: string;
     createIfMissing: boolean;
   }): Promise<Identity<TClaims> | undefined>;
+  checkEligibility?(userId: string, scope: string): Promise<boolean>;
 }
 export interface RateLimitRequest {
   operation: "request_code" | "verify_code" | "refresh";
@@ -170,11 +174,14 @@ export interface AuditEvent {
 export interface Observer {
   emit(event: AuditEvent): void | Promise<void>;
 }
-export interface AccessTokenKey {
-  kid: string;
-  algorithm: "HS256";
-  secret: Uint8Array;
-}
+export type AccessTokenKey =
+  | { kid: string; algorithm: "HS256"; secret: Uint8Array }
+  | {
+      kid: string;
+      algorithm: "ES256" | "RS256" | "EdDSA";
+      privateKey: CryptoKey;
+      publicKey: CryptoKey;
+    };
 export interface TokenPair {
   accessToken: string;
   refreshToken: string;

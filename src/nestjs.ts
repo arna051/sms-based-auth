@@ -4,15 +4,19 @@ import {
   CanActivate,
   Controller,
   createParamDecorator,
+  Delete,
   DynamicModule,
   ExecutionContext,
   ForbiddenException,
+  Get,
   Inject,
   Injectable,
   Module,
+  Param,
   Post,
   SetMetadata,
   UnauthorizedException,
+  UseGuards,
   type Provider,
 } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
@@ -29,6 +33,13 @@ export interface NestAuthService {
   requestCode(input: unknown): Promise<unknown>;
   verifyCode(input: unknown): Promise<unknown>;
   refresh(input: unknown): Promise<unknown>;
+  logout(input: { accessToken: string }): Promise<unknown>;
+  listSessions(input: { accessToken: string }): Promise<unknown>;
+  revokeSession(input: {
+    sessionId: string;
+    accessToken: string;
+  }): Promise<unknown>;
+  revokeAllSessions(input: { accessToken: string }): Promise<unknown>;
 }
 export interface NestAuthOptions {
   auth: NestAuthService;
@@ -42,11 +53,12 @@ export interface NestAuthOptions {
 }
 export interface NestAuthAsyncOptions {
   imports?: DynamicModule["imports"];
-  inject?: unknown[];
+  inject?: any[];
   useFactory: (
-    ...dependencies: never[]
+    ...dependencies: any[]
   ) => NestAuthOptions | Promise<NestAuthOptions>;
   providers?: Provider[];
+  controllers?: boolean;
 }
 const ROLES = Symbol("SMS_AUTH_ROLES");
 const PERMISSIONS = Symbol("SMS_AUTH_PERMISSIONS");
@@ -57,6 +69,10 @@ export const CurrentAuth = createParamDecorator(
   (_data: unknown, context: ExecutionContext) =>
     context.switchToHttp().getRequest<{ smsAuth?: AuthContext }>().smsAuth,
 );
+export const CurrentAccessToken = createParamDecorator(
+  (_data: unknown, context: ExecutionContext) =>
+    context.switchToHttp().getRequest<{ smsAuthToken?: string }>().smsAuthToken,
+);
 
 @Injectable()
 export class SmsAuthGuard implements CanActivate {
@@ -66,12 +82,11 @@ export class SmsAuthGuard implements CanActivate {
     @Inject(Reflector) private readonly reflector: Reflector,
   ) {}
   async canActivate(context: ExecutionContext) {
-    const request = context
-      .switchToHttp()
-      .getRequest<{
-        headers: Record<string, string | undefined>;
-        smsAuth?: AuthContext;
-      }>();
+    const request = context.switchToHttp().getRequest<{
+      headers: Record<string, string | undefined>;
+      smsAuth?: AuthContext;
+      smsAuthToken?: string;
+    }>();
     const bearer =
       request.headers.authorization?.match(/^Bearer ([^\s]+)$/i)?.[1];
     const token =
@@ -88,6 +103,7 @@ export class SmsAuthGuard implements CanActivate {
         this.options.checkSession ?? true,
       );
       request.smsAuth = authContext;
+      request.smsAuthToken = token;
     } catch {
       throw new UnauthorizedException();
     }
@@ -128,6 +144,29 @@ export class SmsAuthController {
   @Post("refresh") refresh(@Body() body: unknown) {
     return this.auth.refresh(body);
   }
+  @UseGuards(SmsAuthGuard)
+  @Post("logout")
+  logout(@CurrentAccessToken() accessToken: string) {
+    return this.auth.logout({ accessToken });
+  }
+  @UseGuards(SmsAuthGuard)
+  @Get("sessions")
+  sessions(@CurrentAccessToken() accessToken: string) {
+    return this.auth.listSessions({ accessToken });
+  }
+  @UseGuards(SmsAuthGuard)
+  @Delete("sessions/:sessionId")
+  revoke(
+    @Param("sessionId") sessionId: string,
+    @CurrentAccessToken() accessToken: string,
+  ) {
+    return this.auth.revokeSession({ sessionId, accessToken });
+  }
+  @UseGuards(SmsAuthGuard)
+  @Post("sessions/revoke-all")
+  revokeAll(@CurrentAccessToken() accessToken: string) {
+    return this.auth.revokeAllSessions({ accessToken });
+  }
 }
 @Module({})
 export class SmsBasedAuthModule {
@@ -140,14 +179,14 @@ export class SmsBasedAuthModule {
         SmsAuthGuard,
       ],
       controllers: options.controllers === false ? [] : [SmsAuthController],
-      exports: [SMS_BASED_AUTH, SmsAuthGuard],
+      exports: [SMS_BASED_AUTH, SMS_AUTH_OPTIONS, SmsAuthGuard],
     };
   }
   static forRootAsync(options: NestAuthAsyncOptions): DynamicModule {
     const optionsProvider: Provider = {
       provide: SMS_AUTH_OPTIONS,
       useFactory: options.useFactory,
-      ...(options.inject ? { inject: options.inject as never[] } : {}),
+      ...(options.inject ? { inject: options.inject } : {}),
     };
     const authProvider: Provider = {
       provide: SMS_BASED_AUTH,
@@ -163,7 +202,8 @@ export class SmsBasedAuthModule {
         authProvider,
         SmsAuthGuard,
       ],
-      exports: [SMS_BASED_AUTH, SmsAuthGuard],
+      controllers: options.controllers === false ? [] : [SmsAuthController],
+      exports: [SMS_BASED_AUTH, SMS_AUTH_OPTIONS, SmsAuthGuard],
     };
   }
 }

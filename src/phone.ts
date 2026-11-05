@@ -25,7 +25,7 @@ export function normalizeIranianPhone(value: string): `+98${string}` {
   let phone = value
     .trim()
     .replace(/[۰-۹٠-٩]/g, (digit) => digitMap[digit] ?? digit)
-    .replace(/[\s()\-\.\u200c\u200d]/g, "");
+    .replace(/[\s()\-.\u200c\u200d]/g, "");
   if (phone.startsWith("0098")) phone = `+98${phone.slice(4)}`;
   else if (phone.startsWith("98")) phone = `+${phone}`;
   else if (phone.startsWith("0")) phone = `+98${phone.slice(1)}`;

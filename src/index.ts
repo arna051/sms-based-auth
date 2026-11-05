@@ -14,6 +14,7 @@ export { normalizeIranianPhone } from "./phone.js";
 export {
   deliverTokens,
   clearTokenCookies,
+  createCsrfTokenCookie,
   parseCookie,
   assertCsrf,
   type TransportMode,

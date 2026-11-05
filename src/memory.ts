@@ -106,7 +106,8 @@ export class MemorySessionStore<
   }
   async revokeOwned(id: string, userId: string) {
     const record = this.records.get(id);
-    if (!record || record.userId !== userId) return false;
+    if (!record || record.userId !== userId || record.status !== "active")
+      return false;
     record.status = "revoked";
     return true;
   }

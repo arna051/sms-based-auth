@@ -6,40 +6,67 @@ import {
 } from "mongoose";
 import { safeEqual } from "./crypto.js";
 import type {
+  AuditEvent,
   ChallengeRecord,
   ChallengeStore,
+  Observer,
   SessionRecord,
   SessionStore,
 } from "./types.js";
 
-interface Models<TClaims extends Record<string, unknown>> {
+export interface AuthIdentityRecord {
+  id: string;
+  scope: string;
+  phone: string;
+  phoneFingerprint: string;
+  userId: string;
+  status: "active" | "disabled" | "deleted";
+  verifiedAt?: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+export interface AuthAuditRecord extends AuditEvent {
+  expiresAt: Date;
+}
+export interface AuthModels {
   Challenge: Model<any>;
   Session: Model<any>;
+  Identity: Model<AuthIdentityRecord>;
+  Audit: Model<AuthAuditRecord>;
 }
 export function createAuthModels<
   TClaims extends Record<string, unknown> = Record<string, unknown>,
->(connection: Connection, prefix = "SmsAuth"): Models<TClaims> {
+>(connection: Connection, prefix = "SmsAuth"): AuthModels {
   const challengeSchema = new Schema<ChallengeRecord>(
     {
       id: { type: String, required: true, unique: true },
-      key: { type: String, required: true, index: true },
+      key: { type: String, required: true },
       phone: { type: String, required: true },
       phoneFingerprint: { type: String, required: true, index: true },
       purpose: { type: String, required: true },
       scope: { type: String, required: true },
       actorUserId: String,
+      actorSessionId: String,
       codeHash: { type: String, required: true, select: false },
       pepperVersion: { type: String, required: true },
       state: { type: String, required: true, index: true },
       attempts: { type: Number, required: true },
       maxAttempts: { type: Number, required: true },
-      expiresAt: { type: Date, required: true, index: true },
+      expiresAt: { type: Date, required: true },
+      cleanupAt: { type: Date, required: true },
       resendAvailableAt: { type: Date, required: true },
       createdAt: { type: Date, required: true },
     },
     { versionKey: false, collection: `${prefix.toLowerCase()}_challenges` },
   );
-  challengeSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+  challengeSchema.index({ cleanupAt: 1 }, { expireAfterSeconds: 0 });
+  challengeSchema.index(
+    { key: 1 },
+    {
+      unique: true,
+      partialFilterExpression: { state: { $in: ["dispatching", "active"] } },
+    },
+  );
   challengeSchema.index({
     scope: 1,
     purpose: 1,
@@ -51,6 +78,7 @@ export function createAuthModels<
       id: { type: String, required: true, unique: true },
       familyId: { type: String, required: true, index: true },
       userId: { type: String, required: true, index: true },
+      scope: { type: String, required: true, index: true },
       refreshHash: { type: String, required: true, select: false },
       spentRefreshHashes: { type: [String], required: true, select: false },
       status: { type: String, required: true, index: true },
@@ -58,7 +86,7 @@ export function createAuthModels<
       permissions: { type: [String], required: true },
       claims: { type: Schema.Types.Mixed, required: true },
       createdAt: { type: Date, required: true },
-      expiresAt: { type: Date, required: true, index: true },
+      expiresAt: { type: Date, required: true },
       lastUsedAt: { type: Date, required: true },
       userAgent: String,
       ipFingerprint: String,
@@ -66,17 +94,71 @@ export function createAuthModels<
     {
       versionKey: "__v",
       optimisticConcurrency: true,
+      minimize: false,
       collection: `${prefix.toLowerCase()}_sessions`,
     },
   );
   sessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+  const identitySchema = new Schema<AuthIdentityRecord>(
+    {
+      id: { type: String, required: true, unique: true },
+      scope: { type: String, required: true },
+      phone: { type: String, required: true },
+      phoneFingerprint: { type: String, required: true },
+      userId: { type: String, required: true },
+      status: { type: String, required: true },
+      verifiedAt: Date,
+      createdAt: { type: Date, required: true },
+      updatedAt: { type: Date, required: true },
+    },
+    { versionKey: false, collection: `${prefix.toLowerCase()}_identities` },
+  );
+  identitySchema.index({ scope: 1, phoneFingerprint: 1 }, { unique: true });
+  identitySchema.index({ scope: 1, userId: 1 }, { unique: true });
+  const auditSchema = new Schema<AuthAuditRecord>(
+    {
+      type: { type: String, required: true },
+      occurredAt: { type: Date, required: true },
+      correlationId: String,
+      userId: String,
+      sessionId: String,
+      phoneFingerprint: String,
+      purpose: String,
+      metadata: Schema.Types.Mixed,
+      expiresAt: { type: Date, required: true },
+    },
+    { versionKey: false, collection: `${prefix.toLowerCase()}_audit` },
+  );
+  auditSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+  auditSchema.index({ occurredAt: 1, type: 1 });
   const Challenge =
     (connection.models[`${prefix}Challenge`] as Model<any> | undefined) ??
     connection.model(`${prefix}Challenge`, challengeSchema);
   const Session =
     (connection.models[`${prefix}Session`] as Model<any> | undefined) ??
     connection.model(`${prefix}Session`, sessionSchema);
-  return { Challenge, Session };
+  const Identity =
+    (connection.models[`${prefix}Identity`] as
+      Model<AuthIdentityRecord> | undefined) ??
+    connection.model<AuthIdentityRecord>(`${prefix}Identity`, identitySchema);
+  const Audit =
+    (connection.models[`${prefix}Audit`] as
+      Model<AuthAuditRecord> | undefined) ??
+    connection.model<AuthAuditRecord>(`${prefix}Audit`, auditSchema);
+  return { Challenge, Session, Identity, Audit };
+}
+
+export class MongooseAuditObserver implements Observer {
+  constructor(
+    private readonly model: Model<AuthAuditRecord>,
+    private readonly retentionMs = 90 * 24 * 60 * 60 * 1000,
+  ) {}
+  async emit(event: AuditEvent) {
+    await this.model.create({
+      ...event,
+      expiresAt: new Date(event.occurredAt.getTime() + this.retentionMs),
+    });
+  }
 }
 async function transaction<T>(
   connection: Connection,
@@ -99,23 +181,49 @@ export class MongooseChallengeStore implements ChallengeStore {
     private readonly model: Model<any>,
   ) {}
   async reserve(record: ChallengeRecord, now: Date) {
-    return transaction(this.connection, async (session) => {
-      const current = await this.model
-        .findOne({ key: record.key, state: { $in: ["active", "dispatching"] } })
-        .session(session);
-      if (current && current.resendAvailableAt > now)
+    try {
+      return await transaction(this.connection, async (session) => {
+        const current = await this.model
+          .findOne({
+            key: record.key,
+            state: { $in: ["active", "dispatching"] },
+          })
+          .session(session);
+        if (current && current.resendAvailableAt > now)
+          return {
+            status: "cooldown" as const,
+            retryAfterMs: current.resendAvailableAt.getTime() - now.getTime(),
+          };
+        await this.model.updateMany(
+          { key: record.key, state: { $in: ["active", "dispatching"] } },
+          { $set: { state: "superseded" } },
+          { session },
+        );
+        await this.model.create([record], { session });
+        return { status: "reserved" as const };
+      });
+    } catch (error) {
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        error.code === 11000
+      ) {
+        const current = await this.model.findOne({
+          key: record.key,
+          state: { $in: ["active", "dispatching"] },
+        });
         return {
           status: "cooldown" as const,
-          retryAfterMs: current.resendAvailableAt.getTime() - now.getTime(),
+          retryAfterMs: Math.max(
+            1,
+            (current?.resendAvailableAt?.getTime() ?? now.getTime() + 1000) -
+              now.getTime(),
+          ),
         };
-      await this.model.updateMany(
-        { key: record.key, state: { $in: ["active", "dispatching"] } },
-        { $set: { state: "superseded" } },
-        { session },
-      );
-      await this.model.create([record], { session });
-      return { status: "reserved" as const };
-    });
+      }
+      throw error;
+    }
   }
   async activate(id: string) {
     return Boolean(
@@ -217,10 +325,10 @@ export class MongooseSessionStore<
     return (
       (
         await this.model.updateOne(
-          { id, userId },
+          { id, userId, status: "active" },
           { $set: { status: "revoked" } },
         )
-      ).matchedCount === 1
+      ).modifiedCount === 1
     );
   }
   async revokeFamily(familyId: string) {

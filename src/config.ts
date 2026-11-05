@@ -1,5 +1,6 @@
 import { z } from "zod";
-const keySchema = z.object({
+
+const hmacKeySchema = z.object({
   kid: z.string().min(1).max(64),
   algorithm: z.literal("HS256"),
   secret: z
@@ -9,12 +10,26 @@ const keySchema = z.object({
       "key secret must be at least 32 bytes",
     ),
 });
+const asymmetricKeySchema = z.object({
+  kid: z.string().min(1).max(64),
+  algorithm: z.enum(["ES256", "RS256", "EdDSA"]),
+  privateKey: z.custom<CryptoKey>(
+    (value) => typeof CryptoKey !== "undefined" && value instanceof CryptoKey,
+  ),
+  publicKey: z.custom<CryptoKey>(
+    (value) => typeof CryptoKey !== "undefined" && value instanceof CryptoKey,
+  ),
+});
+const accessTokenKeySchema = z.discriminatedUnion("algorithm", [
+  hmacKeySchema,
+  asymmetricKeySchema,
+]);
 const schema = z.object({
   issuer: z.string().min(1),
   audience: z.string().min(1),
-  accessTokenKeys: z.array(keySchema).min(1),
+  accessTokenKeys: z.array(accessTokenKeySchema).min(1),
   activeAccessTokenKid: z.string().min(1),
-  pepper: keySchema,
+  pepper: hmacKeySchema,
   codeLength: z.number().int().min(6).max(10).default(6),
   challengeTtlMs: z.number().int().min(30_000).max(900_000).default(300_000),
   resendCooldownMs: z.number().int().min(5_000).max(900_000).default(60_000),

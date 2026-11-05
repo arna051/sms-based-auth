@@ -1,6 +1,7 @@
 import type { Request, RequestHandler, Response } from "express";
 import { AuthError, toAuthProblem } from "./errors.js";
 import {
+  assertCsrf,
   parseCookie,
   type CookieOptions,
   type TransportMode,
@@ -23,6 +24,7 @@ export interface ExpressAuthOptions {
     error?: unknown,
   ) => void;
   onForbidden?: (request: Request, response: Response) => void;
+  csrf?: { expectedOrigin: string; cookieName?: string; headerName?: string };
 }
 export function createExpressAuth<T extends Record<string, unknown>>(
   auth: Verifier<T>,
@@ -72,6 +74,38 @@ export function createExpressAuth<T extends Record<string, unknown>>(
         return forbidden(req, res);
       next();
     };
+  const requireCsrf = (): RequestHandler => (req, res, next) => {
+    try {
+      if (!options.csrf) throw new Error("CSRF options are required");
+      const header = req.headers[options.csrf.headerName ?? "x-csrf-token"];
+      const csrfCookie = parseCookie(
+        req.headers.cookie,
+        options.csrf.cookieName ?? "__Host-sba_csrf",
+      );
+      assertCsrf({
+        expectedOrigin: options.csrf.expectedOrigin,
+        ...(req.headers.origin ? { origin: req.headers.origin } : {}),
+        ...(csrfCookie ? { csrfCookie } : {}),
+        ...(Array.isArray(header)
+          ? header[0]
+            ? { csrfHeader: header[0] }
+            : {}
+          : header
+            ? { csrfHeader: header }
+            : {}),
+      });
+      next();
+    } catch {
+      res
+        .status(403)
+        .type("application/problem+json")
+        .json(
+          toAuthProblem(
+            new AuthError("FORBIDDEN", "CSRF validation failed", 403),
+          ),
+        );
+    }
+  };
   const requirePermissions =
     (...permissions: string[]): RequestHandler =>
     (req, res, next) => {
@@ -108,6 +142,7 @@ export function createExpressAuth<T extends Record<string, unknown>>(
     mode = options.transport?.mode ?? "json",
   ) => {
     const delivered = deliverTokens(tokens, mode, options.transport?.cookies);
+    res.set("Cache-Control", "no-store");
     for (const cookie of delivered.cookies) res.append("Set-Cookie", cookie);
     if (delivered.body) res.json(delivered.body);
     else res.status(204).end();
@@ -117,6 +152,7 @@ export function createExpressAuth<T extends Record<string, unknown>>(
     requireRoles,
     requirePermissions,
     requirePolicy,
+    requireCsrf,
     getAuth: (request: Request) => contexts.get(request),
     sendTokens,
   };

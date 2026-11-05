@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { assertCsrf, deliverTokens, parseCookie } from "../src/transport.js";
-import { createAuthMiddleware } from "../src/edge.js";
+import { SignJWT, generateKeyPair } from "jose";
+import {
+  assertCsrf,
+  createCsrfTokenCookie,
+  deliverTokens,
+  parseCookie,
+} from "../src/transport.js";
+import { createAuthMiddleware, createEdgeVerifier } from "../src/edge.js";
 import type { TokenPair } from "../src/types.js";
 const now = new Date("2026-01-01T00:00:00Z");
 const tokens: TokenPair = {
@@ -25,6 +31,8 @@ describe("transport contracts", () => {
     expect(result.cookies[0]).toContain("HttpOnly");
     expect(result.cookies[0]).toContain("Secure");
     expect(result.cookies[1]).toContain("Path=/auth/refresh");
+    expect(result.cookies[0]).toContain("__Host-sba_access=");
+    expect(result.cookies[1]).toContain("__Secure-sba_refresh=");
   });
   it("rejects insecure SameSite=None", () =>
     expect(() =>
@@ -33,6 +41,9 @@ describe("transport contracts", () => {
   it("parses malformed cookies safely", () =>
     expect(parseCookie("token=%E0%A4%A", "token")).toBeUndefined());
   it("checks double-submit CSRF tokens and origin", () => {
+    const csrf = createCsrfTokenCookie();
+    expect(csrf.cookie).toContain("__Host-sba_csrf=");
+    expect(csrf.cookie).not.toContain("HttpOnly");
     expect(() =>
       assertCsrf({
         expectedOrigin: "https://app.test",
@@ -56,7 +67,7 @@ describe("edge routing boundary", () => {
     const middleware = createAuthMiddleware({
       issuer: "i",
       audience: "a",
-      keys: [{ kid: "k", algorithm: "HS256", secret: new Uint8Array(32) }],
+      keys: [{ kid: "k", algorithm: "ES256", publicKey: {} as CryptoKey }],
       publicRoutes: ["/login"],
       protectedRoutes: ["/dashboard/:path*"],
     });
@@ -70,5 +81,31 @@ describe("edge routing boundary", () => {
     expect(response?.headers.get("location")).toContain(
       "/login?returnTo=%2Fdashboard%2Fsettings",
     );
+  });
+  it("verifies a real asymmetric token and rejects unsafe redirects", async () => {
+    const { privateKey, publicKey } = await generateKeyPair("ES256");
+    const token = await new SignJWT({ sid: "s1" })
+      .setProtectedHeader({ alg: "ES256", typ: "JWT", kid: "edge-1" })
+      .setSubject("u1")
+      .setIssuer("issuer")
+      .setAudience("audience")
+      .setJti("j1")
+      .setIssuedAt()
+      .setExpirationTime("5m")
+      .sign(privateKey);
+    const verify = createEdgeVerifier({
+      issuer: "issuer",
+      audience: "audience",
+      keys: [{ kid: "edge-1", algorithm: "ES256", publicKey }],
+    });
+    expect((await verify(token)).sub).toBe("u1");
+    expect(() =>
+      createAuthMiddleware({
+        issuer: "issuer",
+        audience: "audience",
+        keys: [{ kid: "edge-1", algorithm: "ES256", publicKey }],
+        loginPath: "/\\\\evil.test",
+      }),
+    ).toThrow();
   });
 });

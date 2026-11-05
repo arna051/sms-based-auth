@@ -40,6 +40,7 @@ function fixture(options: { clock?: () => Date; rateLimit?: number } = {}) {
         return { userId: "u1", roles: ["user"], claims: { plan: "pro" } };
       },
     },
+    authorizeScope: async (candidate) => candidate === scope,
     observer: {
       emit(event) {
         events.push(event.type);
@@ -106,18 +107,19 @@ describe("challenge security", () => {
         scope,
       }),
     ).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    const actor = await login(f);
     await f.auth.requestCode({
       phone: "09123456789",
       purpose: "sensitive_action",
       scope,
-      actor: { userId: "u1", sessionId: "s1" },
+      actorAccessToken: actor.accessToken,
     });
     const result = await f.auth.verifyCode({
       phone: "09123456789",
       purpose: "sensitive_action",
       code: f.getCode(),
       scope,
-      actor: { userId: "u1", sessionId: "s1" },
+      actorAccessToken: actor.accessToken,
     });
     expect(result).toEqual({
       kind: "challenge_verified",
@@ -171,8 +173,7 @@ describe("session and token security", () => {
     const f = fixture();
     const tokens = await login(f);
     const sessions = await f.auth.listSessions({
-      userId: "u1",
-      currentSessionId: tokens.sessionId,
+      accessToken: tokens.accessToken,
     });
     expect(sessions[0]).not.toHaveProperty("refreshHash");
     expect(sessions[0]?.current).toBe(true);
@@ -182,8 +183,8 @@ describe("session and token security", () => {
     const tokens = await login(f);
     await expect(
       f.auth.revokeSession({
-        sessionId: tokens.sessionId,
-        actorUserId: "attacker",
+        sessionId: "another-users-session",
+        accessToken: tokens.accessToken,
       }),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
     expect((await f.auth.verifyAccessToken(tokens.accessToken)).userId).toBe(

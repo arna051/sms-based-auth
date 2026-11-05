@@ -2,55 +2,112 @@
   "name": "sms-based-auth",
   "version": "0.1.0",
   "description": "Framework-neutral, security-first SMS authentication for Node.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arna051/sms-based-auth.git"
+  },
+  "bugs": {
+    "url": "https://github.com/arna051/sms-based-auth/issues"
+  },
+  "homepage": "https://github.com/arna051/sms-based-auth#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "sideEffects": false,
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     },
     "./memory": {
-      "types": "./dist/memory.d.ts",
-      "import": "./dist/memory.js",
-      "require": "./dist/memory.cjs"
+      "import": {
+        "types": "./dist/memory.d.ts",
+        "default": "./dist/memory.js"
+      },
+      "require": {
+        "types": "./dist/memory.d.cts",
+        "default": "./dist/memory.cjs"
+      }
     },
     "./express": {
-      "types": "./dist/express.d.ts",
-      "import": "./dist/express.js",
-      "require": "./dist/express.cjs"
+      "import": {
+        "types": "./dist/express.d.ts",
+        "default": "./dist/express.js"
+      },
+      "require": {
+        "types": "./dist/express.d.cts",
+        "default": "./dist/express.cjs"
+      }
     },
     "./nextjs": {
-      "types": "./dist/nextjs.d.ts",
-      "import": "./dist/nextjs.js",
-      "require": "./dist/nextjs.cjs"
+      "import": {
+        "types": "./dist/nextjs.d.ts",
+        "default": "./dist/nextjs.js"
+      },
+      "require": {
+        "types": "./dist/nextjs.d.cts",
+        "default": "./dist/nextjs.cjs"
+      }
     },
     "./edge": {
-      "types": "./dist/edge.d.ts",
-      "import": "./dist/edge.js",
-      "require": "./dist/edge.cjs"
+      "import": {
+        "types": "./dist/edge.d.ts",
+        "default": "./dist/edge.js"
+      },
+      "require": {
+        "types": "./dist/edge.d.cts",
+        "default": "./dist/edge.cjs"
+      }
     },
     "./transport": {
-      "types": "./dist/transport.d.ts",
-      "import": "./dist/transport.js",
-      "require": "./dist/transport.cjs"
+      "import": {
+        "types": "./dist/transport.d.ts",
+        "default": "./dist/transport.js"
+      },
+      "require": {
+        "types": "./dist/transport.d.cts",
+        "default": "./dist/transport.cjs"
+      }
     },
     "./redis": {
-      "types": "./dist/redis.d.ts",
-      "import": "./dist/redis.js",
-      "require": "./dist/redis.cjs"
+      "import": {
+        "types": "./dist/redis.d.ts",
+        "default": "./dist/redis.js"
+      },
+      "require": {
+        "types": "./dist/redis.d.cts",
+        "default": "./dist/redis.cjs"
+      }
     },
     "./mongoose": {
-      "types": "./dist/mongoose.d.ts",
-      "import": "./dist/mongoose.js",
-      "require": "./dist/mongoose.cjs"
+      "import": {
+        "types": "./dist/mongoose.d.ts",
+        "default": "./dist/mongoose.js"
+      },
+      "require": {
+        "types": "./dist/mongoose.d.cts",
+        "default": "./dist/mongoose.cjs"
+      }
     },
     "./nestjs": {
-      "types": "./dist/nestjs.d.ts",
-      "import": "./dist/nestjs.js",
-      "require": "./dist/nestjs.cjs"
+      "import": {
+        "types": "./dist/nestjs.d.ts",
+        "default": "./dist/nestjs.js"
+      },
+      "require": {
+        "types": "./dist/nestjs.d.cts",
+        "default": "./dist/nestjs.cjs"
+      }
     },
     "./package.json": "./package.json"
   },
@@ -58,6 +115,10 @@
     "dist",
     "README.md",
     "SECURITY.md",
+    "THREAT_MODEL.md",
+    "DEPLOYMENT.md",
+    "MIGRATION.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "engines": {
@@ -66,8 +127,17 @@
   "scripts": {
     "build": "tsup",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm test && npm run build",
+    "lint": "eslint src test",
+    "format:check": "prettier --check . --ignore-path .gitignore",
+    "format": "prettier --write . --ignore-path .gitignore",
+    "edge:check": "vitest run test/edge-bundle.test.ts",
+    "test:integration": "INTEGRATION=1 vitest run test/integration.test.ts",
+    "integration:up": "docker compose -f docker-compose.integration.yml up -d --wait",
+    "integration:down": "docker compose -f docker-compose.integration.yml down -v",
+    "package:check": "npm run build && node scripts/verify-package.mjs",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run build",
     "prepublishOnly": "npm run check"
   },
   "keywords": [
@@ -83,22 +153,26 @@
     "zod": "^4.1.0"
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
     "@nestjs/common": "^12.3.3",
     "@nestjs/core": "^12.3.3",
+    "@nestjs/testing": "^12.3.3",
     "@types/express": "^5.0.0",
     "@types/node": "^24.0.0",
     "@types/supertest": "^7.2.1",
-    "eslint": "^10.14.0",
+    "eslint": "^9.39.5",
     "express": "^5.1.0",
     "fast-check": "^4.10.2",
     "mongoose": "^9.12.0",
     "prettier": "^3.9.10",
+    "publint": "^0.3.25",
     "redis": "^6.3.1",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",
     "supertest": "^7.3.1",
     "tsup": "^8.5.0",
     "typescript": "^5.9.0",
+    "typescript-eslint": "^8.72.1",
     "vitest": "^4.0.0"
   },
   "peerDependencies": {
@@ -132,5 +206,9 @@
     "rxjs": {
       "optional": true
     }
+  },
+  "overrides": {
+    "esbuild": "0.28.1",
+    "minimatch": "11.0.1"
   }
 }
