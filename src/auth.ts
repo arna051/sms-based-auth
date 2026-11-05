@@ -1,26 +1,539 @@
-import { SignJWT, jwtVerify } from 'jose';
-import { z } from 'zod';
-import { resolveConfig, type SecurityConfig } from './config.js';
-import { AuthError } from './errors.js';
-import { generateCode, keyedHash, randomId, randomToken } from './crypto.js';
-import { normalizeIranianPhone } from './phone.js';
-import type { AuthContext, AuthPurpose, ChallengeRecord, ChallengeStore, IdentityProvider, RequestContext, SessionRecord, SessionStore, SmsSender, TokenPair } from './types.js';
+import { SignJWT, decodeProtectedHeader, jwtVerify } from "jose";
+import { z } from "zod";
+import { resolveConfig, type SecurityConfig } from "./config.js";
+import { generateCode, keyedHash, randomId, randomToken } from "./crypto.js";
+import { AuthError } from "./errors.js";
+import { normalizeIranianPhone } from "./phone.js";
+import {
+  AUTH_PURPOSES,
+  type AuthContext,
+  type AuthPurpose,
+  type ChallengeRecord,
+  type ChallengeStore,
+  type IdentityProvider,
+  type Observer,
+  type RateLimiter,
+  type RequestContext,
+  type SessionRecord,
+  type SessionStore,
+  type SessionSummary,
+  type SmsSender,
+  type TokenPair,
+  type VerifyCodeResult,
+} from "./types.js";
 
-export interface CreateAuthOptions<TClaims extends Record<string, unknown>, TAction extends string> {
-  config: SecurityConfig; challenges: ChallengeStore; sessions: SessionStore<TClaims>; sms: SmsSender<TAction>;
-  smsActions: Record<AuthPurpose, TAction>; identities: IdentityProvider<TClaims>; clock?: () => Date;
+const requestCodeSchema = z.object({
+  phone: z.string().min(1).max(64),
+  purpose: z.enum(AUTH_PURPOSES),
+  scope: z.string().min(1).max(128).optional(),
+  actor: z
+    .object({ userId: z.string().min(1), sessionId: z.string().min(1) })
+    .optional(),
+});
+const verifyCodeSchema = requestCodeSchema.extend({
+  code: z.string().regex(/^\d{6,10}$/),
+});
+const accessClaims = z.object({
+  sub: z.string().min(1),
+  sid: z.string().min(1),
+  jti: z.string().min(1),
+  iat: z.number().int().positive(),
+  exp: z.number().int().positive(),
+  iss: z.string().min(1),
+  aud: z.union([z.string(), z.array(z.string())]),
+  roles: z.array(z.string()),
+  permissions: z.array(z.string()),
+  claims: z.record(z.string(), z.unknown()),
+});
+
+export interface CreateAuthOptions<
+  TClaims extends Record<string, unknown>,
+  TAction extends string,
+> {
+  config: SecurityConfig;
+  challenges: ChallengeStore;
+  sessions: SessionStore<TClaims>;
+  rateLimiter: RateLimiter;
+  sms: SmsSender<TAction>;
+  smsActions: Record<AuthPurpose, TAction>;
+  identities: IdentityProvider<TClaims>;
+  observer?: Observer;
+  clock?: () => Date;
 }
-const accessClaims = z.object({ sub: z.string(), sid: z.string(), roles: z.array(z.string()), permissions: z.array(z.string()), claims: z.record(z.string(), z.unknown()) });
-export function createSmsBasedAuth<TClaims extends Record<string, unknown> = Record<string, unknown>, TAction extends string = string>(options: CreateAuthOptions<TClaims, TAction>) {
-  const cfg = resolveConfig(options.config), now = options.clock ?? (() => new Date()), key = cfg.secret;
-  const challengeKey = (phone: string, purpose: AuthPurpose, scope: string) => keyedHash(key, 'challenge-key', `${scope}\0${purpose}\0${phone}`);
-  async function mintAccess(record: SessionRecord<TClaims>, at: Date) { return new SignJWT({ sid: record.id, roles: record.roles, permissions: record.permissions, claims: record.claims }).setProtectedHeader({ alg: 'HS256', typ: 'JWT' }).setSubject(record.userId).setIssuer(cfg.issuer).setAudience(cfg.audience).setJti(randomId()).setIssuedAt(Math.floor(at.getTime()/1000)).setExpirationTime(Math.floor(at.getTime()/1000)+cfg.accessTtlSeconds).sign(key); }
-  async function pair(record: SessionRecord<TClaims>, refresh: string, at: Date): Promise<TokenPair> { return { accessToken: await mintAccess(record, at), refreshToken: `${record.id}.${refresh}`, accessTokenExpiresAt: new Date(at.getTime()+cfg.accessTtlSeconds*1000), refreshTokenExpiresAt: record.expiresAt, sessionId: record.id }; }
+async function safelyObserve(
+  observer: Observer | undefined,
+  event: Parameters<Observer["emit"]>[0],
+) {
+  try {
+    await observer?.emit(event);
+  } catch {
+    /* observers cannot break authentication */
+  }
+}
+
+export function createSmsBasedAuth<
+  TClaims extends Record<string, unknown> = Record<string, unknown>,
+  TAction extends string = string,
+>(options: CreateAuthOptions<TClaims, TAction>) {
+  const cfg = resolveConfig(options.config);
+  const now = options.clock ?? (() => new Date());
+  const pepper = cfg.pepper.secret;
+  const accessKeys = new Map(cfg.accessTokenKeys.map((key) => [key.kid, key]));
+  const activeKey = accessKeys.get(cfg.activeAccessTokenKid)!;
+  const scopeOf = (scope: string | undefined) => {
+    if (cfg.requireScope && !scope)
+      throw new AuthError("INVALID_INPUT", "A tenant scope is required", 400);
+    return scope ?? "default";
+  };
+  const fingerprint = (phone: string) =>
+    keyedHash(pepper, "phone-fingerprint", phone);
+  const challengeKey = (
+    phone: string,
+    purpose: AuthPurpose,
+    scope: string,
+    actorUserId?: string,
+  ) =>
+    keyedHash(
+      pepper,
+      "challenge-key",
+      `${scope}\0${purpose}\0${phone}\0${actorUserId ?? ""}`,
+    );
+  const rateKeys = (
+    phoneFingerprint: string,
+    scope: string,
+    context?: RequestContext,
+  ) => [
+    `phone:${phoneFingerprint}`,
+    `scope:${scope}`,
+    ...(context?.ip
+      ? [`ip:${keyedHash(pepper, "ip-fingerprint", context.ip)}`]
+      : []),
+    ...(context?.deviceId
+      ? [`device:${keyedHash(pepper, "device-fingerprint", context.deviceId)}`]
+      : []),
+  ];
+  const checkRate = async (
+    operation: "request_code" | "verify_code" | "refresh",
+    keys: string[],
+    at: Date,
+  ) => {
+    const result = await options.rateLimiter.consume({
+      operation,
+      keys,
+      now: at,
+    });
+    if (!result.allowed)
+      throw new AuthError(
+        "RATE_LIMITED",
+        "Too many requests",
+        429,
+        result.retryAfterMs,
+      );
+  };
+  async function mintAccess(record: SessionRecord<TClaims>, at: Date) {
+    return new SignJWT({
+      sid: record.id,
+      roles: record.roles,
+      permissions: record.permissions,
+      claims: record.claims,
+    })
+      .setProtectedHeader({
+        alg: activeKey.algorithm,
+        typ: "JWT",
+        kid: activeKey.kid,
+      })
+      .setSubject(record.userId)
+      .setIssuer(cfg.issuer)
+      .setAudience(cfg.audience)
+      .setJti(randomId())
+      .setIssuedAt(Math.floor(at.getTime() / 1000))
+      .setExpirationTime(Math.floor(at.getTime() / 1000) + cfg.accessTtlSeconds)
+      .sign(activeKey.secret);
+  }
+  async function tokenPair(
+    record: SessionRecord<TClaims>,
+    refresh: string,
+    at: Date,
+  ): Promise<TokenPair> {
+    return {
+      accessToken: await mintAccess(record, at),
+      refreshToken: `${record.id}.${refresh}`,
+      accessTokenExpiresAt: new Date(
+        at.getTime() + cfg.accessTtlSeconds * 1000,
+      ),
+      refreshTokenExpiresAt: record.expiresAt,
+      sessionId: record.id,
+    };
+  }
+
   return {
-    async requestCode(input: { phone: string; purpose: AuthPurpose; scope?: string; context?: RequestContext }) { const phone = normalizeIranianPhone(input.phone), scope = input.scope ?? 'default', code = generateCode(cfg.codeLength), at = now(), keyValue = challengeKey(phone,input.purpose,scope); const record: ChallengeRecord = { id: randomId(), key: keyValue, phone, purpose: input.purpose, scope, codeHash: keyedHash(key,'otp',`${keyValue}\0${code}`), state: 'dispatching', attempts: 0, maxAttempts: cfg.maxAttempts, createdAt: at, expiresAt: new Date(at.getTime()+cfg.challengeTtlMs) }; try { await options.sms.send(options.smsActions[input.purpose], { recipient: phone, code }, input.context?.signal ? { signal: input.context.signal } : undefined); record.state = 'active'; await options.challenges.createReplacing(record); } catch (cause) { throw new AuthError('INVALID_CHALLENGE', 'Unable to dispatch authentication challenge', 503, cause); } return { accepted: true as const, expiresAt: record.expiresAt }; },
-    async verifyCode(input: { phone: string; purpose: AuthPurpose; code: string; scope?: string; context?: RequestContext }) { const phone=normalizeIranianPhone(input.phone), scope=input.scope??'default'; if (!/^\d{6,10}$/.test(input.code)) throw new AuthError('INVALID_CHALLENGE','Invalid or expired code',401); const keyValue=challengeKey(phone,input.purpose,scope), result=await options.challenges.consumeAttempt(keyValue,keyedHash(key,'otp',`${keyValue}\0${input.code}`),now()); if(result.status!=='verified') throw new AuthError('INVALID_CHALLENGE','Invalid or expired code',401); const identity=await options.identities.resolve({phone,purpose:input.purpose,scope}); if(identity.eligible===false) throw new AuthError('ACCOUNT_INELIGIBLE','Account is not eligible',403); const at=now(), raw=randomToken(); const session: SessionRecord<TClaims>={id:randomId(),familyId:randomId(),userId:identity.userId,refreshHash:keyedHash(key,'refresh',raw),spentRefreshHashes:[],status:'active',roles:identity.roles??[],permissions:identity.permissions??[],claims:identity.claims??({} as TClaims),createdAt:at,lastUsedAt:at,expiresAt:new Date(at.getTime()+cfg.refreshTtlSeconds*1000),...(input.context?.ip?{ip:input.context.ip}:{}),...(input.context?.userAgent?{userAgent:input.context.userAgent}:{})}; await options.sessions.create(session); return pair(session,raw,at); },
-    async refresh(input: { refreshToken: string }) { const [id,raw,...rest]=input.refreshToken.split('.'); if(!id||!raw||rest.length) throw new AuthError('INVALID_TOKEN','Invalid refresh token',401); const current=await options.sessions.get(id); if(!current) throw new AuthError('INVALID_TOKEN','Invalid refresh token',401); const next=randomToken(), at=now(), status=await options.sessions.rotate(id,keyedHash(key,'refresh',raw),keyedHash(key,'refresh',next),at); if(status==='reused') throw new AuthError('TOKEN_REUSE','Refresh token reuse detected',401); if(status!=='rotated') throw new AuthError('SESSION_REVOKED','Session is invalid',401); const updated=await options.sessions.get(id); if(!updated) throw new AuthError('INVALID_TOKEN','Invalid session',401); return pair(updated,next,at); },
-    async verifyAccessToken(token: string, checkSession=false): Promise<AuthContext<TClaims>> { try { const verified=await jwtVerify(token,key,{algorithms:['HS256'],issuer:cfg.issuer,audience:cfg.audience,clockTolerance:cfg.clockToleranceSeconds}); const parsed=accessClaims.parse(verified.payload); if(checkSession){const session=await options.sessions.get(parsed.sid); if(!session||session.status!=='active') throw new AuthError('SESSION_REVOKED','Session revoked',401);} return {userId:parsed.sub,sessionId:parsed.sid,roles:parsed.roles,permissions:parsed.permissions,claims:parsed.claims as TClaims,issuedAt:new Date((verified.payload.iat??0)*1000),expiresAt:new Date((verified.payload.exp??0)*1000)}; } catch(cause) { if(cause instanceof AuthError) throw cause; throw new AuthError('INVALID_TOKEN','Invalid access token',401,cause); } },
-    listSessions: (userId: string) => options.sessions.list(userId), revokeSession: (sessionId: string) => options.sessions.revoke(sessionId), revokeAllSessions: (userId: string) => options.sessions.revokeAll(userId)
+    async requestCode(raw: {
+      phone: string;
+      purpose: AuthPurpose;
+      scope?: string;
+      actor?: { userId: string; sessionId: string };
+      context?: RequestContext;
+    }) {
+      const input = requestCodeSchema.parse(raw);
+      const scope = scopeOf(input.scope);
+      const phone = normalizeIranianPhone(input.phone);
+      if (
+        (input.purpose === "phone_verification" ||
+          input.purpose === "sensitive_action") &&
+        !input.actor
+      )
+        throw new AuthError(
+          "INVALID_INPUT",
+          "This purpose requires an authenticated actor",
+          400,
+        );
+      const at = now();
+      const phoneFingerprint = fingerprint(phone);
+      await checkRate(
+        "request_code",
+        rateKeys(phoneFingerprint, scope, raw.context),
+        at,
+      );
+      const code = generateCode(cfg.codeLength);
+      const key = challengeKey(
+        phone,
+        input.purpose,
+        scope,
+        input.actor?.userId,
+      );
+      const record: ChallengeRecord = {
+        id: randomId(),
+        key,
+        phone,
+        phoneFingerprint,
+        purpose: input.purpose,
+        scope,
+        ...(input.actor ? { actorUserId: input.actor.userId } : {}),
+        codeHash: keyedHash(pepper, `otp:${cfg.pepper.kid}`, `${key}\0${code}`),
+        pepperVersion: cfg.pepper.kid,
+        state: "dispatching",
+        attempts: 0,
+        maxAttempts: cfg.maxAttempts,
+        createdAt: at,
+        expiresAt: new Date(at.getTime() + cfg.challengeTtlMs),
+        resendAvailableAt: new Date(at.getTime() + cfg.resendCooldownMs),
+      };
+      const reservation = await options.challenges.reserve(record, at);
+      if (reservation.status === "cooldown")
+        throw new AuthError(
+          "CHALLENGE_COOLDOWN",
+          "A challenge was recently sent",
+          429,
+          reservation.retryAfterMs,
+        );
+      await safelyObserve(options.observer, {
+        type: "challenge.requested",
+        occurredAt: at,
+        phoneFingerprint,
+        purpose: input.purpose,
+        ...(raw.context?.correlationId
+          ? { correlationId: raw.context.correlationId }
+          : {}),
+      });
+      try {
+        await options.sms.send(
+          options.smsActions[input.purpose],
+          { recipient: phone, code },
+          raw.context?.signal ? { signal: raw.context.signal } : undefined,
+        );
+      } catch {
+        await options.challenges.fail(record.id);
+        await safelyObserve(options.observer, {
+          type: "challenge.failed",
+          occurredAt: now(),
+          phoneFingerprint,
+          purpose: input.purpose,
+          ...(raw.context?.correlationId
+            ? { correlationId: raw.context.correlationId }
+            : {}),
+        });
+        throw new AuthError(
+          "SMS_DELIVERY_FAILED",
+          "Unable to dispatch authentication challenge",
+          503,
+        );
+      }
+      if (!(await options.challenges.activate(record.id)))
+        throw new AuthError(
+          "INVALID_CHALLENGE",
+          "Challenge was superseded",
+          409,
+        );
+      await safelyObserve(options.observer, {
+        type: "challenge.dispatched",
+        occurredAt: now(),
+        phoneFingerprint,
+        purpose: input.purpose,
+        ...(raw.context?.correlationId
+          ? { correlationId: raw.context.correlationId }
+          : {}),
+      });
+      return { accepted: true as const, expiresAt: record.expiresAt };
+    },
+
+    async verifyCode(raw: {
+      phone: string;
+      purpose: AuthPurpose;
+      code: string;
+      scope?: string;
+      actor?: { userId: string; sessionId: string };
+      context?: RequestContext;
+    }): Promise<VerifyCodeResult> {
+      const input = verifyCodeSchema.parse(raw);
+      const scope = scopeOf(input.scope);
+      const phone = normalizeIranianPhone(input.phone);
+      if (
+        (input.purpose === "phone_verification" ||
+          input.purpose === "sensitive_action") &&
+        !input.actor
+      )
+        throw new AuthError(
+          "INVALID_INPUT",
+          "This purpose requires an authenticated actor",
+          400,
+        );
+      const at = now();
+      const phoneFingerprint = fingerprint(phone);
+      await checkRate(
+        "verify_code",
+        rateKeys(phoneFingerprint, scope, raw.context),
+        at,
+      );
+      const key = challengeKey(
+        phone,
+        input.purpose,
+        scope,
+        input.actor?.userId,
+      );
+      const result = await options.challenges.consumeAttempt(
+        key,
+        keyedHash(pepper, `otp:${cfg.pepper.kid}`, `${key}\0${input.code}`),
+        at,
+      );
+      if (result.status !== "verified") {
+        await safelyObserve(options.observer, {
+          type: "challenge.rejected",
+          occurredAt: at,
+          phoneFingerprint,
+          purpose: input.purpose,
+          ...(raw.context?.correlationId
+            ? { correlationId: raw.context.correlationId }
+            : {}),
+        });
+        throw new AuthError(
+          "INVALID_CHALLENGE",
+          "Invalid or expired code",
+          401,
+        );
+      }
+      if (
+        input.purpose === "phone_verification" ||
+        input.purpose === "sensitive_action"
+      ) {
+        await safelyObserve(options.observer, {
+          type: "challenge.verified",
+          occurredAt: at,
+          phoneFingerprint,
+          purpose: input.purpose,
+          userId: input.actor!.userId,
+        });
+        return {
+          kind: "challenge_verified",
+          purpose: input.purpose,
+          userId: input.actor!.userId,
+        };
+      }
+      const identity = await options.identities.resolve({
+        phone,
+        purpose: input.purpose,
+        scope,
+        createIfMissing: input.purpose === "login",
+      });
+      if (!identity)
+        throw new AuthError(
+          "ACCOUNT_NOT_FOUND",
+          "Account is not eligible",
+          403,
+        );
+      if (identity.eligible === false)
+        throw new AuthError(
+          "ACCOUNT_INELIGIBLE",
+          "Account is not eligible",
+          403,
+        );
+      const rawRefresh = randomToken();
+      const session: SessionRecord<TClaims> = {
+        id: randomId(),
+        familyId: randomId(),
+        userId: identity.userId,
+        refreshHash: keyedHash(pepper, `refresh:${cfg.pepper.kid}`, rawRefresh),
+        spentRefreshHashes: [],
+        status: "active",
+        roles: identity.roles ?? [],
+        permissions: identity.permissions ?? [],
+        claims: identity.claims ?? ({} as TClaims),
+        createdAt: at,
+        lastUsedAt: at,
+        expiresAt: new Date(at.getTime() + cfg.refreshTtlSeconds * 1000),
+        ...(raw.context?.userAgent ? { userAgent: raw.context.userAgent } : {}),
+        ...(cfg.retainIpFingerprint && raw.context?.ip
+          ? {
+              ipFingerprint: keyedHash(
+                pepper,
+                "ip-fingerprint",
+                raw.context.ip,
+              ),
+            }
+          : {}),
+      };
+      await options.sessions.create(session);
+      await safelyObserve(options.observer, {
+        type: "session.created",
+        occurredAt: at,
+        sessionId: session.id,
+        userId: session.userId,
+        phoneFingerprint,
+      });
+      return {
+        kind: "session",
+        tokens: await tokenPair(session, rawRefresh, at),
+      };
+    },
+
+    async refresh(input: { refreshToken: string; context?: RequestContext }) {
+      const parts = input.refreshToken.split(".");
+      if (parts.length !== 2 || !parts[0] || !parts[1])
+        throw new AuthError("INVALID_TOKEN", "Invalid refresh token", 401);
+      const [sessionId, presented] = parts as [string, string];
+      const at = now();
+      await checkRate(
+        "refresh",
+        [
+          `session:${sessionId}`,
+          ...(input.context?.ip
+            ? [`ip:${keyedHash(pepper, "ip-fingerprint", input.context.ip)}`]
+            : []),
+        ],
+        at,
+      );
+      const next = randomToken();
+      const result = await options.sessions.rotate(
+        sessionId,
+        keyedHash(pepper, `refresh:${cfg.pepper.kid}`, presented),
+        keyedHash(pepper, `refresh:${cfg.pepper.kid}`, next),
+        at,
+      );
+      if (result.status === "reused") {
+        await safelyObserve(options.observer, {
+          type: "session.reuse_detected",
+          occurredAt: at,
+          sessionId,
+        });
+        throw new AuthError("TOKEN_REUSE", "Refresh token reuse detected", 401);
+      }
+      if (result.status !== "rotated")
+        throw new AuthError("SESSION_REVOKED", "Session is invalid", 401);
+      await safelyObserve(options.observer, {
+        type: "session.refreshed",
+        occurredAt: at,
+        sessionId,
+        userId: result.record.userId,
+      });
+      return tokenPair(result.record, next, at);
+    },
+
+    async verifyAccessToken(
+      token: string,
+      checkSession = true,
+    ): Promise<AuthContext<TClaims>> {
+      try {
+        const header = decodeProtectedHeader(token);
+        if (header.alg !== "HS256" || typeof header.kid !== "string")
+          throw new Error("invalid protected header");
+        const key = accessKeys.get(header.kid);
+        if (!key) throw new Error("unknown key ID");
+        const verified = await jwtVerify(token, key.secret, {
+          algorithms: [key.algorithm],
+          issuer: cfg.issuer,
+          audience: cfg.audience,
+          clockTolerance: cfg.clockToleranceSeconds,
+          typ: "JWT",
+        });
+        const parsed = accessClaims.parse(verified.payload);
+        if (checkSession) {
+          const session = await options.sessions.get(parsed.sid);
+          if (
+            !session ||
+            session.status !== "active" ||
+            session.expiresAt <= now()
+          )
+            throw new AuthError("SESSION_REVOKED", "Session revoked", 401);
+        }
+        return {
+          userId: parsed.sub,
+          sessionId: parsed.sid,
+          roles: parsed.roles,
+          permissions: parsed.permissions,
+          claims: parsed.claims as TClaims,
+          issuedAt: new Date(parsed.iat * 1000),
+          expiresAt: new Date(parsed.exp * 1000),
+        };
+      } catch (error) {
+        if (error instanceof AuthError) throw error;
+        throw new AuthError("INVALID_TOKEN", "Invalid access token", 401);
+      }
+    },
+
+    async listSessions(actor: {
+      userId: string;
+      currentSessionId: string;
+    }): Promise<SessionSummary[]> {
+      return (await options.sessions.list(actor.userId)).map((session) => ({
+        id: session.id,
+        current: session.id === actor.currentSessionId,
+        status: session.status,
+        createdAt: session.createdAt,
+        expiresAt: session.expiresAt,
+        lastUsedAt: session.lastUsedAt,
+        ...(session.userAgent ? { userAgent: session.userAgent } : {}),
+      }));
+    },
+    async revokeSession(input: { sessionId: string; actorUserId: string }) {
+      if (
+        !(await options.sessions.revokeOwned(
+          input.sessionId,
+          input.actorUserId,
+        ))
+      )
+        throw new AuthError(
+          "FORBIDDEN",
+          "Session does not belong to the actor",
+          403,
+        );
+      await safelyObserve(options.observer, {
+        type: "session.revoked",
+        occurredAt: now(),
+        sessionId: input.sessionId,
+        userId: input.actorUserId,
+      });
+    },
+    async logout(input: { sessionId: string; actorUserId: string }) {
+      return this.revokeSession(input);
+    },
+    async revokeAllSessions(input: { actorUserId: string }) {
+      const count = await options.sessions.revokeAll(input.actorUserId);
+      await safelyObserve(options.observer, {
+        type: "session.all_revoked",
+        occurredAt: now(),
+        userId: input.actorUserId,
+        metadata: { count },
+      });
+      return count;
+    },
   };
 }

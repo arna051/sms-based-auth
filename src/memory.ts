@@ -1,23 +1,171 @@
-import { safeEqual } from './crypto.js';
-import type { ChallengeRecord, ChallengeStore, SessionRecord, SessionStore } from './types.js';
+import { safeEqual } from "./crypto.js";
+import type {
+  ChallengeRecord,
+  ChallengeStore,
+  RateLimiter,
+  RateLimitRequest,
+  SessionRecord,
+  SessionStore,
+} from "./types.js";
 
 export class MemoryChallengeStore implements ChallengeStore {
-  private records = new Map<string, ChallengeRecord>();
-  async createReplacing(record: ChallengeRecord) { const old = this.records.get(record.key); if (old?.state === 'active') old.state = 'superseded'; this.records.set(record.key, structuredClone(record)); }
+  private readonly recordsByKey = new Map<string, ChallengeRecord>();
+  private readonly keysById = new Map<string, string>();
+
+  async reserve(record: ChallengeRecord, now: Date) {
+    const current = this.recordsByKey.get(record.key);
+    if (
+      current &&
+      (current.state === "active" || current.state === "dispatching") &&
+      current.resendAvailableAt > now
+    ) {
+      return {
+        status: "cooldown" as const,
+        retryAfterMs: current.resendAvailableAt.getTime() - now.getTime(),
+      };
+    }
+    if (
+      current &&
+      (current.state === "active" || current.state === "dispatching")
+    )
+      current.state = "superseded";
+    this.recordsByKey.set(record.key, structuredClone(record));
+    this.keysById.set(record.id, record.key);
+    return { status: "reserved" as const };
+  }
+
+  async activate(id: string) {
+    const key = this.keysById.get(id);
+    const record = key ? this.recordsByKey.get(key) : undefined;
+    if (!record || record.id !== id || record.state !== "dispatching")
+      return false;
+    record.state = "active";
+    return true;
+  }
+
+  async fail(id: string) {
+    const key = this.keysById.get(id);
+    const record = key ? this.recordsByKey.get(key) : undefined;
+    if (record?.id === id && record.state === "dispatching")
+      record.state = "failed";
+  }
+
   async consumeAttempt(key: string, hash: string, now: Date) {
-    const record = this.records.get(key); if (!record || record.state !== 'active') return { status: 'missing' as const };
-    if (record.expiresAt <= now) { record.state = 'expired'; return { status: 'expired' as const }; }
-    if (safeEqual(record.codeHash, hash)) { record.state = 'verified'; return { status: 'verified' as const, record: structuredClone(record) }; }
-    record.attempts++; if (record.attempts >= record.maxAttempts) { record.state = 'locked'; return { status: 'locked' as const }; }
-    return { status: 'invalid' as const };
+    const record = this.recordsByKey.get(key);
+    if (!record || record.state !== "active")
+      return { status: "missing" as const };
+    if (record.expiresAt <= now) {
+      record.state = "expired";
+      return { status: "expired" as const };
+    }
+    if (safeEqual(record.codeHash, hash)) {
+      record.state = "verified";
+      return { status: "verified" as const, record: structuredClone(record) };
+    }
+    record.attempts += 1;
+    if (record.attempts >= record.maxAttempts) {
+      record.state = "locked";
+      return { status: "locked" as const };
+    }
+    return { status: "invalid" as const };
   }
 }
-export class MemorySessionStore<TClaims extends Record<string, unknown> = Record<string, unknown>> implements SessionStore<TClaims> {
-  private records = new Map<string, SessionRecord<TClaims>>();
-  async create(record: SessionRecord<TClaims>) { this.records.set(record.id, structuredClone(record)); }
-  async rotate(id: string, hash: string, next: string, now: Date) { const r = this.records.get(id); if (!r || r.status !== 'active' || r.expiresAt <= now) return 'invalid'; if (r.spentRefreshHashes.some(spent => safeEqual(spent, hash))) { r.status = 'compromised'; return 'reused'; } if (!safeEqual(r.refreshHash, hash)) return 'invalid'; r.spentRefreshHashes.push(r.refreshHash); r.refreshHash = next; r.lastUsedAt = now; return 'rotated'; }
-  async get(id: string) { const r = this.records.get(id); return r ? structuredClone(r) : undefined; }
-  async list(userId: string) { return [...this.records.values()].filter(r => r.userId === userId).map(r => structuredClone(r)); }
-  async revoke(id: string) { const r = this.records.get(id); if (r) r.status = 'revoked'; }
-  async revokeAll(userId: string) { let count = 0; for (const r of this.records.values()) if (r.userId === userId && r.status === 'active') { r.status = 'revoked'; count++; } return count; }
+
+export class MemorySessionStore<
+  TClaims extends Record<string, unknown> = Record<string, unknown>,
+> implements SessionStore<TClaims> {
+  private readonly records = new Map<string, SessionRecord<TClaims>>();
+  async create(record: SessionRecord<TClaims>) {
+    this.records.set(record.id, structuredClone(record));
+  }
+  async rotate(id: string, hash: string, next: string, now: Date) {
+    const record = this.records.get(id);
+    if (!record || record.status !== "active" || record.expiresAt <= now)
+      return { status: "invalid" as const };
+    if (record.spentRefreshHashes.some((spent) => safeEqual(spent, hash))) {
+      for (const candidate of this.records.values())
+        if (candidate.familyId === record.familyId)
+          candidate.status = "compromised";
+      return { status: "reused" as const };
+    }
+    if (!safeEqual(record.refreshHash, hash))
+      return { status: "invalid" as const };
+    record.spentRefreshHashes.push(record.refreshHash);
+    record.refreshHash = next;
+    record.lastUsedAt = now;
+    return { status: "rotated" as const, record: structuredClone(record) };
+  }
+  async get(id: string) {
+    const record = this.records.get(id);
+    return record ? structuredClone(record) : undefined;
+  }
+  async list(userId: string) {
+    return [...this.records.values()]
+      .filter((record) => record.userId === userId)
+      .map((record) => structuredClone(record));
+  }
+  async revokeOwned(id: string, userId: string) {
+    const record = this.records.get(id);
+    if (!record || record.userId !== userId) return false;
+    record.status = "revoked";
+    return true;
+  }
+  async revokeFamily(familyId: string) {
+    let count = 0;
+    for (const record of this.records.values())
+      if (record.familyId === familyId && record.status === "active") {
+        record.status = "revoked";
+        count += 1;
+      }
+    return count;
+  }
+  async revokeAll(userId: string) {
+    let count = 0;
+    for (const record of this.records.values())
+      if (record.userId === userId && record.status === "active") {
+        record.status = "revoked";
+        count += 1;
+      }
+    return count;
+  }
+}
+
+export interface MemoryRateLimiterOptions {
+  limit?: number;
+  windowMs?: number;
+}
+export class MemoryRateLimiter implements RateLimiter {
+  private readonly buckets = new Map<string, number[]>();
+  private readonly limit: number;
+  private readonly windowMs: number;
+  constructor(options: MemoryRateLimiterOptions = {}) {
+    this.limit = options.limit ?? 5;
+    this.windowMs = options.windowMs ?? 60_000;
+  }
+  async consume(input: RateLimitRequest) {
+    const timestamp = input.now.getTime();
+    const cutoff = timestamp - this.windowMs;
+    let retryAfterMs = 0;
+    for (const key of input.keys) {
+      const bucketKey = `${input.operation}:${key}`;
+      const entries = (this.buckets.get(bucketKey) ?? []).filter(
+        (entry) => entry > cutoff,
+      );
+      if (entries.length >= this.limit)
+        retryAfterMs = Math.max(
+          retryAfterMs,
+          entries[0]! + this.windowMs - timestamp,
+        );
+    }
+    if (retryAfterMs > 0) return { allowed: false as const, retryAfterMs };
+    for (const key of input.keys) {
+      const bucketKey = `${input.operation}:${key}`;
+      const entries = (this.buckets.get(bucketKey) ?? []).filter(
+        (entry) => entry > cutoff,
+      );
+      entries.push(timestamp);
+      this.buckets.set(bucketKey, entries);
+    }
+    return { allowed: true as const };
+  }
 }
