@@ -1,0 +1,11 @@
+import { describe, expect, it } from 'vitest';
+import { createSmsBasedAuth, normalizeIranianPhone } from '../src/index.js';
+import { MemoryChallengeStore, MemorySessionStore } from '../src/memory.js';
+const secret = new Uint8Array(32).fill(7);
+function fixture() { let code=''; const sessions=new MemorySessionStore(); const auth=createSmsBasedAuth({config:{issuer:'test',audience:'test',secret},challenges:new MemoryChallengeStore(),sessions,sms:{async send(_a,v){code=v.code;}},smsActions:{login:'login',phone_verification:'verify',account_recovery:'recover',sensitive_action:'sensitive'},identities:{async resolve(){return {userId:'u1',roles:['user'],claims:{plan:'pro'}};}}}); return {auth,sessions,getCode:()=>code}; }
+describe('sms auth',()=>{
+  it('normalizes Iranian numbers',()=>{expect(normalizeIranianPhone('۰۹۱۲ ۳۴۵ ۶۷۸۹')).toBe('+989123456789');});
+  it('issues, verifies, rotates and detects reuse',async()=>{const f=fixture(); await f.auth.requestCode({phone:'09123456789',purpose:'login'}); const first=await f.auth.verifyCode({phone:'09123456789',purpose:'login',code:f.getCode()}); const context=await f.auth.verifyAccessToken(first.accessToken,true); expect(context.userId).toBe('u1'); const second=await f.auth.refresh({refreshToken:first.refreshToken}); await expect(f.auth.refresh({refreshToken:first.refreshToken})).rejects.toMatchObject({code:'TOKEN_REUSE'}); await expect(f.auth.refresh({refreshToken:second.refreshToken})).rejects.toMatchObject({code:'SESSION_REVOKED'});});
+  it('allows a challenge only once',async()=>{const f=fixture(); await f.auth.requestCode({phone:'09123456789',purpose:'login'}); await f.auth.verifyCode({phone:'09123456789',purpose:'login',code:f.getCode()}); await expect(f.auth.verifyCode({phone:'09123456789',purpose:'login',code:f.getCode()})).rejects.toMatchObject({code:'INVALID_CHALLENGE'});});
+  it('detects reuse of any spent refresh token',async()=>{const f=fixture(); await f.auth.requestCode({phone:'09123456789',purpose:'login'}); const first=await f.auth.verifyCode({phone:'09123456789',purpose:'login',code:f.getCode()}); const second=await f.auth.refresh({refreshToken:first.refreshToken}); await f.auth.refresh({refreshToken:second.refreshToken}); await expect(f.auth.refresh({refreshToken:first.refreshToken})).rejects.toMatchObject({code:'TOKEN_REUSE'});});
+});

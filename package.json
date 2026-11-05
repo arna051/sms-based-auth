@@ -1,0 +1,29 @@
+{
+  "name": "sms-based-auth",
+  "version": "0.1.0",
+  "description": "Framework-neutral, security-first SMS authentication for Node.js",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js", "require": "./dist/index.cjs" },
+    "./memory": { "types": "./dist/memory.d.ts", "import": "./dist/memory.js", "require": "./dist/memory.cjs" },
+    "./express": { "types": "./dist/express.d.ts", "import": "./dist/express.js", "require": "./dist/express.cjs" },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "README.md", "SECURITY.md", "LICENSE"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "keywords": ["authentication", "sms", "otp", "typescript", "security"],
+  "license": "MIT",
+  "dependencies": { "jose": "^6.1.0", "zod": "^4.1.0" },
+  "devDependencies": { "@types/express": "^5.0.0", "@types/node": "^24.0.0", "express": "^5.1.0", "tsup": "^8.5.0", "typescript": "^5.9.0", "vitest": "^4.0.0" },
+  "peerDependencies": { "express": ">=4.18" },
+  "peerDependenciesMeta": { "express": { "optional": true } }
+}
