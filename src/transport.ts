@@ -54,6 +54,13 @@ function resolveCookieOptions(options: CookieOptions) {
       "__Host- access cookies require Secure, Path=/, and no Domain",
     );
   if (
+    refreshName.startsWith("__Host-") &&
+    (!secure || options.domain || refreshPath !== "/")
+  )
+    throw new Error(
+      "__Host- refresh cookies require Secure, Path=/, and no Domain",
+    );
+  if (
     (accessName.startsWith("__Secure-") ||
       refreshName.startsWith("__Secure-")) &&
     !secure
@@ -114,15 +121,20 @@ export function createCsrfTokenCookie(
     maxAgeSeconds?: number;
   } = {},
 ) {
+  const name = options.name ?? "__Host-sba_csrf";
+  const secure = options.secure ?? true;
+  const path = options.path ?? "/";
+  if (name.startsWith("__Host-") && (!secure || path !== "/"))
+    throw new Error("__Host- CSRF cookies require Secure and Path=/");
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   const token = Array.from(bytes, (byte) =>
     byte.toString(16).padStart(2, "0"),
   ).join("");
-  const cookie = serializeCookie(options.name ?? "__Host-sba_csrf", token, {
+  const cookie = serializeCookie(name, token, {
     maxAge: options.maxAgeSeconds ?? 3600,
-    secure: options.secure ?? true,
+    secure,
     sameSite: options.sameSite ?? "strict",
-    path: options.path ?? "/",
+    path,
     httpOnly: false,
   });
   return { token, cookie };
@@ -171,10 +183,18 @@ export function assertCsrf(input: {
   csrfCookie?: string;
   csrfHeader?: string;
 }) {
+  const equal = (left: string, right: string) => {
+    if (left.length !== right.length) return false;
+    let difference = 0;
+    for (let index = 0; index < left.length; index++)
+      difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
+    return difference === 0;
+  };
   if (
     input.origin !== input.expectedOrigin ||
     !input.csrfCookie ||
-    input.csrfCookie !== input.csrfHeader
+    !input.csrfHeader ||
+    !equal(input.csrfCookie, input.csrfHeader)
   )
     throw new Error("CSRF validation failed");
 }

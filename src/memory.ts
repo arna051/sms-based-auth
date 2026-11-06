@@ -16,7 +16,9 @@ export class MemoryChallengeStore implements ChallengeStore {
     const current = this.recordsByKey.get(record.key);
     if (
       current &&
-      (current.state === "active" || current.state === "dispatching") &&
+      (["active", "dispatching", "verifying"] as const).includes(
+        current.state as "active" | "dispatching" | "verifying",
+      ) &&
       current.resendAvailableAt > now
     ) {
       return {
@@ -26,7 +28,9 @@ export class MemoryChallengeStore implements ChallengeStore {
     }
     if (
       current &&
-      (current.state === "active" || current.state === "dispatching")
+      (["active", "dispatching", "verifying"] as const).includes(
+        current.state as "active" | "dispatching" | "verifying",
+      )
     )
       current.state = "superseded";
     this.recordsByKey.set(record.key, structuredClone(record));
@@ -59,7 +63,7 @@ export class MemoryChallengeStore implements ChallengeStore {
       return { status: "expired" as const };
     }
     if (safeEqual(record.codeHash, hash)) {
-      record.state = "verified";
+      record.state = "verifying";
       return { status: "verified" as const, record: structuredClone(record) };
     }
     record.attempts += 1;
@@ -68,6 +72,42 @@ export class MemoryChallengeStore implements ChallengeStore {
       return { status: "locked" as const };
     }
     return { status: "invalid" as const };
+  }
+
+  async consumeAttemptVersioned(
+    candidates: ReadonlyArray<{
+      pepperVersion: string;
+      key: string;
+      candidateHash: string;
+    }>,
+    now: Date,
+  ) {
+    const record = candidates
+      .map((item) => this.recordsByKey.get(item.key))
+      .find((item) => item?.state === "active");
+    if (!record) return { status: "missing" as const };
+    const candidate = candidates.find(
+      (item) =>
+        item.key === record.key && item.pepperVersion === record.pepperVersion,
+    );
+    if (!candidate) return { status: "missing" as const };
+    return this.consumeAttempt(candidate.key, candidate.candidateHash, now);
+  }
+
+  async completeVerification(id: string) {
+    const key = this.keysById.get(id);
+    const record = key ? this.recordsByKey.get(key) : undefined;
+    if (!record || record.id !== id || record.state !== "verifying")
+      return false;
+    record.state = "verified";
+    return true;
+  }
+
+  async releaseVerification(id: string) {
+    const key = this.keysById.get(id);
+    const record = key ? this.recordsByKey.get(key) : undefined;
+    if (record?.id === id && record.state === "verifying")
+      record.state = "active";
   }
 }
 
@@ -78,11 +118,30 @@ export class MemorySessionStore<
   async create(record: SessionRecord<TClaims>) {
     this.records.set(record.id, structuredClone(record));
   }
-  async rotate(id: string, hash: string, next: string, now: Date) {
+  async rotate(
+    id: string,
+    hash: string,
+    next: string,
+    now: Date,
+    update?: {
+      nextPepperVersion?: string;
+      presentedHashes?: string[];
+      authorization?: {
+        roles: string[];
+        permissions: string[];
+        claims: TClaims;
+      };
+    },
+  ) {
     const record = this.records.get(id);
     if (!record || record.status !== "active" || record.expiresAt <= now)
       return { status: "invalid" as const };
-    if (record.spentRefreshHashes.some((spent) => safeEqual(spent, hash))) {
+    const presentedHashes = [hash, ...(update?.presentedHashes ?? [])];
+    if (
+      record.spentRefreshHashes.some((spent) =>
+        presentedHashes.some((presented) => safeEqual(spent, presented)),
+      )
+    ) {
       for (const candidate of this.records.values())
         if (candidate.familyId === record.familyId)
           candidate.status = "compromised";
@@ -92,6 +151,13 @@ export class MemorySessionStore<
       return { status: "invalid" as const };
     record.spentRefreshHashes.push(record.refreshHash);
     record.refreshHash = next;
+    if (update?.nextPepperVersion)
+      record.refreshPepperVersion = update.nextPepperVersion;
+    if (update?.authorization) {
+      record.roles = update.authorization.roles;
+      record.permissions = update.authorization.permissions;
+      record.claims = update.authorization.claims;
+    }
     record.lastUsedAt = now;
     return { status: "rotated" as const, record: structuredClone(record) };
   }
@@ -99,14 +165,19 @@ export class MemorySessionStore<
     const record = this.records.get(id);
     return record ? structuredClone(record) : undefined;
   }
-  async list(userId: string) {
+  async list(scope: string, userId: string) {
     return [...this.records.values()]
-      .filter((record) => record.userId === userId)
+      .filter((record) => record.scope === scope && record.userId === userId)
       .map((record) => structuredClone(record));
   }
-  async revokeOwned(id: string, userId: string) {
+  async revokeOwned(id: string, scope: string, userId: string) {
     const record = this.records.get(id);
-    if (!record || record.userId !== userId || record.status !== "active")
+    if (
+      !record ||
+      record.scope !== scope ||
+      record.userId !== userId ||
+      record.status !== "active"
+    )
       return false;
     record.status = "revoked";
     return true;
@@ -120,10 +191,14 @@ export class MemorySessionStore<
       }
     return count;
   }
-  async revokeAll(userId: string) {
+  async revokeAll(scope: string, userId: string) {
     let count = 0;
     for (const record of this.records.values())
-      if (record.userId === userId && record.status === "active") {
+      if (
+        record.scope === scope &&
+        record.userId === userId &&
+        record.status === "active"
+      ) {
         record.status = "revoked";
         count += 1;
       }

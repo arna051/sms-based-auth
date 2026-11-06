@@ -38,6 +38,17 @@ describe("transport contracts", () => {
     expect(() =>
       deliverTokens(tokens, "cookie", { secure: false, sameSite: "none" }, now),
     ).toThrow());
+  it("rejects invalid __Host- cookie configurations", () => {
+    expect(() =>
+      deliverTokens(
+        tokens,
+        "cookie",
+        { refreshName: "__Host-refresh", refreshPath: "/auth/refresh" },
+        now,
+      ),
+    ).toThrow();
+    expect(() => createCsrfTokenCookie({ secure: false })).toThrow();
+  });
   it("parses malformed cookies safely", () =>
     expect(parseCookie("token=%E0%A4%A", "token")).toBeUndefined());
   it("checks double-submit CSRF tokens and origin", () => {

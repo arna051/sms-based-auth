@@ -64,7 +64,9 @@ export function createAuthModels<
     { key: 1 },
     {
       unique: true,
-      partialFilterExpression: { state: { $in: ["dispatching", "active"] } },
+      partialFilterExpression: {
+        state: { $in: ["dispatching", "active", "verifying"] },
+      },
     },
   );
   challengeSchema.index({
@@ -80,6 +82,7 @@ export function createAuthModels<
       userId: { type: String, required: true, index: true },
       scope: { type: String, required: true, index: true },
       refreshHash: { type: String, required: true, select: false },
+      refreshPepperVersion: String,
       spentRefreshHashes: { type: [String], required: true, select: false },
       status: { type: String, required: true, index: true },
       roles: { type: [String], required: true },
@@ -99,6 +102,7 @@ export function createAuthModels<
     },
   );
   sessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+  sessionSchema.index({ scope: 1, userId: 1, status: 1 });
   const identitySchema = new Schema<AuthIdentityRecord>(
     {
       id: { type: String, required: true, unique: true },
@@ -186,7 +190,7 @@ export class MongooseChallengeStore implements ChallengeStore {
         const current = await this.model
           .findOne({
             key: record.key,
-            state: { $in: ["active", "dispatching"] },
+            state: { $in: ["active", "dispatching", "verifying"] },
           })
           .session(session);
         if (current && current.resendAvailableAt > now)
@@ -195,7 +199,10 @@ export class MongooseChallengeStore implements ChallengeStore {
             retryAfterMs: current.resendAvailableAt.getTime() - now.getTime(),
           };
         await this.model.updateMany(
-          { key: record.key, state: { $in: ["active", "dispatching"] } },
+          {
+            key: record.key,
+            state: { $in: ["active", "dispatching", "verifying"] },
+          },
           { $set: { state: "superseded" } },
           { session },
         );
@@ -211,7 +218,7 @@ export class MongooseChallengeStore implements ChallengeStore {
       ) {
         const current = await this.model.findOne({
           key: record.key,
-          state: { $in: ["active", "dispatching"] },
+          state: { $in: ["active", "dispatching", "verifying"] },
         });
         return {
           status: "cooldown" as const,
@@ -240,19 +247,70 @@ export class MongooseChallengeStore implements ChallengeStore {
     );
   }
   async consumeAttempt(key: string, candidateHash: string, now: Date) {
+    return transaction(this.connection, (session) =>
+      this.consumeAttemptInTransaction(key, candidateHash, now, session),
+    );
+  }
+  private async consumeAttemptInTransaction(
+    key: string,
+    candidateHash: string,
+    now: Date,
+    session: ClientSession,
+  ) {
+    const record = await this.model
+      .findOne({ key, state: "active" })
+      .select("+codeHash")
+      .session(session);
+    if (!record) return { status: "missing" as const };
+    if (record.expiresAt <= now) {
+      record.state = "expired";
+      await record.save({ session });
+      return { status: "expired" as const };
+    }
+    if (safeEqual(record.codeHash, candidateHash)) {
+      record.state = "verifying";
+      await record.save({ session });
+      return { status: "verified" as const, record: record.toObject() };
+    }
+    record.attempts += 1;
+    if (record.attempts >= record.maxAttempts) {
+      record.state = "locked";
+      await record.save({ session });
+      return { status: "locked" as const };
+    }
+    await record.save({ session });
+    return { status: "invalid" as const };
+  }
+  async consumeAttemptVersioned(
+    candidates: ReadonlyArray<{
+      pepperVersion: string;
+      key: string;
+      candidateHash: string;
+    }>,
+    now: Date,
+  ) {
     return transaction(this.connection, async (session) => {
       const record = await this.model
-        .findOne({ key, state: "active" })
+        .findOne({
+          key: { $in: candidates.map((candidate) => candidate.key) },
+          state: "active",
+        })
         .select("+codeHash")
         .session(session);
       if (!record) return { status: "missing" as const };
+      const candidate = candidates.find(
+        (item) =>
+          item.key === record.key &&
+          item.pepperVersion === record.pepperVersion,
+      );
+      if (!candidate) return { status: "missing" as const };
       if (record.expiresAt <= now) {
         record.state = "expired";
         await record.save({ session });
         return { status: "expired" as const };
       }
-      if (safeEqual(record.codeHash, candidateHash)) {
-        record.state = "verified";
+      if (safeEqual(record.codeHash, candidate.candidateHash)) {
+        record.state = "verifying";
         await record.save({ session });
         return { status: "verified" as const, record: record.toObject() };
       }
@@ -266,6 +324,20 @@ export class MongooseChallengeStore implements ChallengeStore {
       return { status: "invalid" as const };
     });
   }
+  async completeVerification(id: string) {
+    return Boolean(
+      await this.model.findOneAndUpdate(
+        { id, state: "verifying" },
+        { $set: { state: "verified" } },
+      ),
+    );
+  }
+  async releaseVerification(id: string) {
+    await this.model.updateOne(
+      { id, state: "verifying" },
+      { $set: { state: "active" } },
+    );
+  }
 }
 export class MongooseSessionStore<
   TClaims extends Record<string, unknown> = Record<string, unknown>,
@@ -277,7 +349,21 @@ export class MongooseSessionStore<
   async create(record: SessionRecord<TClaims>) {
     await this.model.create(record);
   }
-  async rotate(id: string, hash: string, next: string, now: Date) {
+  async rotate(
+    id: string,
+    hash: string,
+    next: string,
+    now: Date,
+    update?: {
+      nextPepperVersion?: string;
+      presentedHashes?: string[];
+      authorization?: {
+        roles: string[];
+        permissions: string[];
+        claims: TClaims;
+      };
+    },
+  ) {
     return transaction(this.connection, async (session) => {
       const record = await this.model
         .findOne({ id })
@@ -285,9 +371,10 @@ export class MongooseSessionStore<
         .session(session);
       if (!record || record.status !== "active" || record.expiresAt <= now)
         return { status: "invalid" as const };
+      const presentedHashes = [hash, ...(update?.presentedHashes ?? [])];
       if (
         record.spentRefreshHashes.some((spent: string) =>
-          safeEqual(spent, hash),
+          presentedHashes.some((presented) => safeEqual(spent, presented)),
         )
       ) {
         await this.model.updateMany(
@@ -301,6 +388,13 @@ export class MongooseSessionStore<
         return { status: "invalid" as const };
       record.spentRefreshHashes.push(record.refreshHash);
       record.refreshHash = next;
+      if (update?.nextPepperVersion)
+        record.refreshPepperVersion = update.nextPepperVersion;
+      if (update?.authorization) {
+        record.roles = update.authorization.roles;
+        record.permissions = update.authorization.permissions;
+        record.claims = update.authorization.claims;
+      }
       record.lastUsedAt = now;
       await record.save({ session });
       return {
@@ -316,16 +410,16 @@ export class MongooseSessionStore<
         .lean()) as SessionRecord<TClaims> | null) ?? undefined
     );
   }
-  async list(userId: string) {
+  async list(scope: string, userId: string) {
     return (await this.model
-      .find({ userId })
+      .find({ scope, userId })
       .lean()) as SessionRecord<TClaims>[];
   }
-  async revokeOwned(id: string, userId: string) {
+  async revokeOwned(id: string, scope: string, userId: string) {
     return (
       (
         await this.model.updateOne(
-          { id, userId, status: "active" },
+          { id, scope, userId, status: "active" },
           { $set: { status: "revoked" } },
         )
       ).modifiedCount === 1
@@ -339,10 +433,10 @@ export class MongooseSessionStore<
       )
     ).modifiedCount;
   }
-  async revokeAll(userId: string) {
+  async revokeAll(scope: string, userId: string) {
     return (
       await this.model.updateMany(
-        { userId, status: "active" },
+        { scope, userId, status: "active" },
         { $set: { status: "revoked" } },
       )
     ).modifiedCount;

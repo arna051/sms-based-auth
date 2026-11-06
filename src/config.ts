@@ -30,6 +30,8 @@ const schema = z.object({
   accessTokenKeys: z.array(accessTokenKeySchema).min(1),
   activeAccessTokenKid: z.string().min(1),
   pepper: hmacKeySchema,
+  verificationPeppers: z.array(hmacKeySchema).max(8).default([]),
+  fingerprintPepper: hmacKeySchema.optional(),
   codeLength: z.number().int().min(6).max(10).default(6),
   challengeTtlMs: z.number().int().min(30_000).max(900_000).default(300_000),
   resendCooldownMs: z.number().int().min(5_000).max(900_000).default(60_000),
@@ -46,7 +48,9 @@ const schema = z.object({
   retainIpFingerprint: z.boolean().default(false),
 });
 export type SecurityConfig = z.input<typeof schema>;
-export type ResolvedSecurityConfig = z.output<typeof schema>;
+export type ResolvedSecurityConfig = z.output<typeof schema> & {
+  pepperRing: z.output<typeof hmacKeySchema>[];
+};
 export function resolveConfig(value: SecurityConfig): ResolvedSecurityConfig {
   const config = schema.parse(value);
   if (
@@ -62,5 +66,12 @@ export function resolveConfig(value: SecurityConfig): ResolvedSecurityConfig {
     config.accessTokenKeys.length
   )
     throw new Error("access-token key IDs must be unique");
-  return config;
+  const pepperRing = [config.pepper, ...config.verificationPeppers];
+  if (new Set(pepperRing.map((key) => key.kid)).size !== pepperRing.length)
+    throw new Error("pepper key IDs must be unique");
+  if (pepperRing.length > 1 && !config.fingerprintPepper)
+    throw new Error(
+      "fingerprintPepper is required during pepper rotation to preserve stable challenge and abuse keys",
+    );
+  return { ...config, pepperRing };
 }

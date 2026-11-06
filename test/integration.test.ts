@@ -71,6 +71,34 @@ integration("real persistence concurrency", () => {
     expect(
       attempts.filter((result) => result.status === "verified"),
     ).toHaveLength(1);
+
+    await store.reserve(
+      { ...base, id: "versioned", key: "challenge-old", codeHash: hash },
+      now,
+    );
+    await store.activate("versioned");
+    const versionedAttempts = await Promise.all(
+      Array.from({ length: 10 }, () =>
+        store.consumeAttemptVersioned(
+          [
+            {
+              pepperVersion: "p2",
+              key: "challenge-new",
+              candidateHash: "wrong",
+            },
+            {
+              pepperVersion: "p1",
+              key: "challenge-old",
+              candidateHash: hash,
+            },
+          ],
+          now,
+        ),
+      ),
+    );
+    expect(
+      versionedAttempts.filter((result) => result.status === "verified"),
+    ).toHaveLength(1);
   }, 30_000);
   it("rotates a refresh token atomically", async () => {
     const models = createAuthModels(connection, "Integration");
@@ -95,12 +123,25 @@ integration("real persistence concurrency", () => {
     await store.create(record);
     const rotations = await Promise.all(
       Array.from({ length: 10 }, (_, index) =>
-        store.rotate("session", "current", `next-${index}`, now),
+        store.rotate("session", "current", `next-${index}`, now, {
+          nextPepperVersion: "p2",
+          authorization: {
+            roles: ["admin"],
+            permissions: ["orders.read"],
+            claims: { plan: "pro" },
+          },
+        }),
       ),
     );
     expect(
       rotations.filter((result) => result.status === "rotated"),
     ).toHaveLength(1);
+    expect(await store.get("session")).toMatchObject({
+      refreshPepperVersion: "p2",
+      roles: ["admin"],
+      permissions: ["orders.read"],
+      claims: { plan: "pro" },
+    });
   }, 30_000);
   it("enforces a distributed Redis bucket", async () => {
     await redis.flushDb();

@@ -63,6 +63,8 @@ const auth = createSmsBasedAuth({
   identities: {
     resolve: ({ phone, purpose, scope, createIfMissing }) =>
       userRepository.resolvePhone({ phone, purpose, scope, createIfMissing }),
+    reauthorize: ({ userId, scope, sessionId }) =>
+      userRepository.loadAuthorization({ userId, scope, sessionId }),
   },
 });
 ```
@@ -123,6 +125,9 @@ app.post("/settings", expressAuth.requireCsrf(), handler);
 ```
 
 NestJS exports `SmsBasedAuthModule`, `SmsAuthGuard`, `CurrentAuth`, `RequireRoles`, and `RequirePermissions`, with `forRoot` and `forRootAsync`. Controllers can be disabled.
+The built-in controller accepts `transport: { mode, cookies }`, reads refresh
+cookies when no body token is provided, clears cookies at logout, and enforces
+the configured CSRF origin/token pair for unsafe cookie-authenticated routes.
 
 Next.js exports `withAuth` for Node App Router handlers. Pages Router is deferred. Mark routes using database/session checks as `runtime = "nodejs"`.
 
@@ -131,6 +136,14 @@ The `edge` export only verifies short-lived asymmetric tokens and makes routing 
 ## Security and operations
 
 Read [THREAT_MODEL.md](THREAT_MODEL.md), [DEPLOYMENT.md](DEPLOYMENT.md), [SECURITY.md](SECURITY.md), and [MIGRATION.md](MIGRATION.md) before production use. Keep access-token signing keys, OTP peppers, refresh hashes, OTPs, cookies, and provider secrets out of logs.
+
+For pepper rotation, make the new `pepper` active and retain prior keys in
+`verificationPeppers` until all live challenges and refresh sessions using them
+have expired. Configure a separate, stable `fingerprintPepper` so rotating OTP
+and refresh secrets does not reset abuse buckets. When `identities.reauthorize`
+is supplied, every refresh atomically persists and mints the latest trusted
+roles, permissions, and claims; an unresolved or ineligible identity revokes
+that user's scoped sessions.
 
 ## Validation
 

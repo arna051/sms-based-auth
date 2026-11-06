@@ -5,6 +5,7 @@ describe("Next.js adapter", () => {
     const auth = {
       verifyAccessToken: async () => ({
         userId: "u1",
+        scope: "tenant",
         sessionId: "s1",
         roles: [],
         permissions: [],

@@ -9,6 +9,7 @@ export type SessionPurpose = "login" | "account_recovery";
 export type ChallengeState =
   | "dispatching"
   | "active"
+  | "verifying"
   | "verified"
   | "failed"
   | "expired"
@@ -27,6 +28,7 @@ export interface AuthContext<
   TClaims extends Record<string, unknown> = Record<string, unknown>,
 > {
   userId: string;
+  scope: string;
   sessionId: string;
   roles: string[];
   permissions: string[];
@@ -61,9 +63,22 @@ export interface ChallengeStore {
   reserve(record: ChallengeRecord, now: Date): Promise<ChallengeReservation>;
   activate(id: string): Promise<boolean>;
   fail(id: string): Promise<void>;
+  completeVerification(id: string): Promise<boolean>;
+  releaseVerification(id: string): Promise<void>;
   consumeAttempt(
     key: string,
     candidateHash: string,
+    now: Date,
+  ): Promise<{
+    status: "verified" | "invalid" | "expired" | "locked" | "missing";
+    record?: ChallengeRecord;
+  }>;
+  consumeAttemptVersioned?(
+    candidates: ReadonlyArray<{
+      pepperVersion: string;
+      key: string;
+      candidateHash: string;
+    }>,
     now: Date,
   ): Promise<{
     status: "verified" | "invalid" | "expired" | "locked" | "missing";
@@ -78,6 +93,7 @@ export interface SessionRecord<
   userId: string;
   scope: string;
   refreshHash: string;
+  refreshPepperVersion?: string;
   spentRefreshHashes: string[];
   status: SessionStatus;
   roles: string[];
@@ -107,15 +123,28 @@ export interface SessionStore<
     presentedHash: string,
     nextHash: string,
     now: Date,
+    update?: {
+      nextPepperVersion?: string;
+      presentedHashes?: string[];
+      authorization?: {
+        roles: string[];
+        permissions: string[];
+        claims: TClaims;
+      };
+    },
   ): Promise<
     | { status: "rotated"; record: SessionRecord<TClaims> }
     | { status: "reused" | "invalid" }
   >;
   get(sessionId: string): Promise<SessionRecord<TClaims> | undefined>;
-  list(userId: string): Promise<SessionRecord<TClaims>[]>;
-  revokeOwned(sessionId: string, userId: string): Promise<boolean>;
+  list(scope: string, userId: string): Promise<SessionRecord<TClaims>[]>;
+  revokeOwned(
+    sessionId: string,
+    scope: string,
+    userId: string,
+  ): Promise<boolean>;
   revokeFamily(familyId: string): Promise<number>;
-  revokeAll(userId: string): Promise<number>;
+  revokeAll(scope: string, userId: string): Promise<number>;
 }
 export interface SmsSender<TAction extends string = string> {
   send(
@@ -139,6 +168,19 @@ export interface IdentityProvider<TClaims extends Record<string, unknown>> {
     createIfMissing: boolean;
   }): Promise<Identity<TClaims> | undefined>;
   checkEligibility?(userId: string, scope: string): Promise<boolean>;
+  reauthorize?(input: {
+    userId: string;
+    scope: string;
+    sessionId: string;
+  }): Promise<
+    | {
+        roles?: string[];
+        permissions?: string[];
+        claims?: TClaims;
+        eligible?: boolean;
+      }
+    | undefined
+  >;
 }
 export interface RateLimitRequest {
   operation: "request_code" | "verify_code" | "refresh";

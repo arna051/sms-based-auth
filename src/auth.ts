@@ -33,6 +33,7 @@ const verifyCodeSchema = requestCodeSchema.extend({
 });
 const accessClaims = z.object({
   sub: z.string().min(1),
+  scp: z.string().min(1),
   sid: z.string().min(1),
   jti: z.string().min(1),
   iat: z.number().int().positive(),
@@ -77,9 +78,28 @@ export function createSmsBasedAuth<
   TClaims extends Record<string, unknown> = Record<string, unknown>,
   TAction extends string = string,
 >(options: CreateAuthOptions<TClaims, TAction>) {
+  for (const purpose of AUTH_PURPOSES) {
+    const action = options.smsActions[purpose];
+    if (typeof action !== "string" || action.trim().length === 0)
+      throw new AuthError(
+        "MISCONFIGURED",
+        `Missing SMS action for ${purpose}`,
+        500,
+      );
+  }
   const cfg = resolveConfig(options.config);
   const now = options.clock ?? (() => new Date());
   const pepper = cfg.pepper.secret;
+  const fingerprintPepper = cfg.fingerprintPepper?.secret ?? pepper;
+  const pepperByKid = new Map(
+    cfg.pepperRing.map((key) => [key.kid, key.secret]),
+  );
+  if (cfg.pepperRing.length > 1 && !options.challenges.consumeAttemptVersioned)
+    throw new AuthError(
+      "MISCONFIGURED",
+      "Challenge store does not support pepper rotation",
+      500,
+    );
   const accessKeys = new Map(cfg.accessTokenKeys.map((key) => [key.kid, key]));
   const activeKey = accessKeys.get(cfg.activeAccessTokenKid)!;
   const scopeOf = (scope: string | undefined) => {
@@ -88,7 +108,7 @@ export function createSmsBasedAuth<
     return scope ?? "default";
   };
   const fingerprint = (phone: string) =>
-    keyedHash(pepper, "phone-fingerprint", phone);
+    keyedHash(fingerprintPepper, "phone-fingerprint", phone);
   const challengeKey = (
     phone: string,
     purpose: AuthPurpose,
@@ -97,22 +117,19 @@ export function createSmsBasedAuth<
     actorSessionId?: string,
   ) =>
     keyedHash(
-      pepper,
+      fingerprintPepper,
       "challenge-key",
       `${scope}\0${purpose}\0${phone}\0${actorUserId ?? ""}\0${actorSessionId ?? ""}`,
     );
-  const rateKeys = (
-    phoneFingerprint: string,
-    scope: string,
-    context?: RequestContext,
-  ) => [
+  const rateKeys = (phoneFingerprint: string, context?: RequestContext) => [
     `phone:${phoneFingerprint}`,
-    `scope:${scope}`,
     ...(context?.ip
-      ? [`ip:${keyedHash(pepper, "ip-fingerprint", context.ip)}`]
+      ? [`ip:${keyedHash(fingerprintPepper, "ip-fingerprint", context.ip)}`]
       : []),
     ...(context?.deviceId
-      ? [`device:${keyedHash(pepper, "device-fingerprint", context.deviceId)}`]
+      ? [
+          `device:${keyedHash(fingerprintPepper, "device-fingerprint", context.deviceId)}`,
+        ]
       : []),
   ];
   const checkRate = async (
@@ -136,6 +153,7 @@ export function createSmsBasedAuth<
   async function mintAccess(record: SessionRecord<TClaims>, at: Date) {
     return new SignJWT({
       sid: record.id,
+      scp: record.scope,
       roles: record.roles,
       permissions: record.permissions,
       claims: record.claims,
@@ -204,12 +222,14 @@ export function createSmsBasedAuth<
           !session ||
           session.status !== "active" ||
           session.expiresAt <= now() ||
-          session.userId !== parsed.sub
+          session.userId !== parsed.sub ||
+          session.scope !== parsed.scp
         )
           throw new AuthError("SESSION_REVOKED", "Session revoked", 401);
       }
       return {
         userId: parsed.sub,
+        scope: parsed.scp,
         sessionId: parsed.sid,
         roles: parsed.roles,
         permissions: parsed.permissions,
@@ -238,7 +258,7 @@ export function createSmsBasedAuth<
       const phoneFingerprint = fingerprint(phone);
       await checkRate(
         "request_code",
-        rateKeys(phoneFingerprint, scope, raw.context),
+        rateKeys(phoneFingerprint, raw.context),
         at,
       );
       if (!(await options.authorizeScope(scope, raw.context)))
@@ -265,6 +285,12 @@ export function createSmsBasedAuth<
       const actor = input.actorAccessToken
         ? await verifyAccessToken(input.actorAccessToken, true)
         : undefined;
+      if (actor && actor.scope !== scope)
+        throw new AuthError(
+          "FORBIDDEN",
+          "Actor scope does not match request scope",
+          403,
+        );
       const code = generateCode(cfg.codeLength);
       const key = challengeKey(
         phone,
@@ -366,7 +392,7 @@ export function createSmsBasedAuth<
       const phoneFingerprint = fingerprint(phone);
       await checkRate(
         "verify_code",
-        rateKeys(phoneFingerprint, scope, raw.context),
+        rateKeys(phoneFingerprint, raw.context),
         at,
       );
       if (!(await options.authorizeScope(scope, raw.context)))
@@ -393,18 +419,38 @@ export function createSmsBasedAuth<
       const actor = input.actorAccessToken
         ? await verifyAccessToken(input.actorAccessToken, true)
         : undefined;
-      const key = challengeKey(
-        phone,
-        input.purpose,
-        scope,
-        actor?.userId,
-        actor?.sessionId,
-      );
-      const result = await options.challenges.consumeAttempt(
-        key,
-        keyedHash(pepper, `otp:${cfg.pepper.kid}`, `${key}\0${input.code}`),
-        at,
-      );
+      if (actor && actor.scope !== scope)
+        throw new AuthError(
+          "FORBIDDEN",
+          "Actor scope does not match request scope",
+          403,
+        );
+      const candidates = cfg.pepperRing.map((keyConfig) => {
+        const key = challengeKey(
+          phone,
+          input.purpose,
+          scope,
+          actor?.userId,
+          actor?.sessionId,
+        );
+        return {
+          pepperVersion: keyConfig.kid,
+          key,
+          candidateHash: keyedHash(
+            keyConfig.secret,
+            `otp:${keyConfig.kid}`,
+            `${key}\0${input.code}`,
+          ),
+        };
+      });
+      const result =
+        candidates.length === 1
+          ? await options.challenges.consumeAttempt(
+              candidates[0]!.key,
+              candidates[0]!.candidateHash,
+              at,
+            )
+          : await options.challenges.consumeAttemptVersioned!(candidates, at);
       if (result.status !== "verified") {
         await safelyObserve(options.observer, {
           type: "challenge.rejected",
@@ -425,75 +471,109 @@ export function createSmsBasedAuth<
         input.purpose === "phone_verification" ||
         input.purpose === "sensitive_action"
       ) {
+        if (!actor)
+          throw new AuthError(
+            "INVALID_TOKEN",
+            "Authenticated actor required",
+            401,
+          );
+        if (!(await options.challenges.completeVerification(result.record!.id)))
+          throw new AuthError(
+            "INVALID_CHALLENGE",
+            "Challenge is no longer valid",
+            401,
+          );
         await safelyObserve(options.observer, {
           type: "challenge.verified",
           occurredAt: at,
           phoneFingerprint,
           purpose: input.purpose,
-          userId: actor!.userId,
+          userId: actor.userId,
         });
         return {
           kind: "challenge_verified",
           purpose: input.purpose,
-          userId: actor!.userId,
+          userId: actor.userId,
         };
       }
-      const identity = await options.identities.resolve({
-        phone,
-        purpose: input.purpose,
-        scope,
-        createIfMissing: input.purpose === "login",
-      });
-      if (!identity)
-        throw new AuthError(
-          "ACCOUNT_NOT_FOUND",
-          "Account is not eligible",
-          403,
-        );
-      if (identity.eligible === false)
-        throw new AuthError(
-          "ACCOUNT_INELIGIBLE",
-          "Account is not eligible",
-          403,
-        );
-      const rawRefresh = randomToken();
-      const session: SessionRecord<TClaims> = {
-        id: randomId(),
-        familyId: randomId(),
-        userId: identity.userId,
-        scope,
-        refreshHash: keyedHash(pepper, `refresh:${cfg.pepper.kid}`, rawRefresh),
-        spentRefreshHashes: [],
-        status: "active",
-        roles: identity.roles ?? [],
-        permissions: identity.permissions ?? [],
-        claims: identity.claims ?? ({} as TClaims),
-        createdAt: at,
-        lastUsedAt: at,
-        expiresAt: new Date(at.getTime() + cfg.refreshTtlSeconds * 1000),
-        ...(raw.context?.userAgent ? { userAgent: raw.context.userAgent } : {}),
-        ...(cfg.retainIpFingerprint && raw.context?.ip
-          ? {
-              ipFingerprint: keyedHash(
-                pepper,
-                "ip-fingerprint",
-                raw.context.ip,
-              ),
-            }
-          : {}),
-      };
-      await options.sessions.create(session);
-      await safelyObserve(options.observer, {
-        type: "session.created",
-        occurredAt: at,
-        sessionId: session.id,
-        userId: session.userId,
-        phoneFingerprint,
-      });
-      return {
-        kind: "session",
-        tokens: await tokenPair(session, rawRefresh, at),
-      };
+      const challengeId = result.record!.id;
+      let session: SessionRecord<TClaims> | undefined;
+      try {
+        const identity = await options.identities.resolve({
+          phone,
+          purpose: input.purpose,
+          scope,
+          createIfMissing: input.purpose === "login",
+        });
+        if (!identity)
+          throw new AuthError(
+            "ACCOUNT_NOT_FOUND",
+            "Account is not eligible",
+            403,
+          );
+        if (identity.eligible === false)
+          throw new AuthError(
+            "ACCOUNT_INELIGIBLE",
+            "Account is not eligible",
+            403,
+          );
+        const rawRefresh = randomToken();
+        session = {
+          id: randomId(),
+          familyId: randomId(),
+          userId: identity.userId,
+          scope,
+          refreshHash: keyedHash(
+            pepper,
+            `refresh:${cfg.pepper.kid}`,
+            rawRefresh,
+          ),
+          refreshPepperVersion: cfg.pepper.kid,
+          spentRefreshHashes: [],
+          status: "active",
+          roles: identity.roles ?? [],
+          permissions: identity.permissions ?? [],
+          claims: identity.claims ?? ({} as TClaims),
+          createdAt: at,
+          lastUsedAt: at,
+          expiresAt: new Date(at.getTime() + cfg.refreshTtlSeconds * 1000),
+          ...(raw.context?.userAgent
+            ? { userAgent: raw.context.userAgent }
+            : {}),
+          ...(cfg.retainIpFingerprint && raw.context?.ip
+            ? {
+                ipFingerprint: keyedHash(
+                  fingerprintPepper,
+                  "ip-fingerprint",
+                  raw.context.ip,
+                ),
+              }
+            : {}),
+        };
+        await options.sessions.create(session);
+        if (!(await options.challenges.completeVerification(challengeId))) {
+          await options.sessions.revokeOwned(session.id, scope, session.userId);
+          throw new AuthError(
+            "INVALID_CHALLENGE",
+            "Challenge is no longer valid",
+            401,
+          );
+        }
+        await safelyObserve(options.observer, {
+          type: "session.created",
+          occurredAt: at,
+          sessionId: session.id,
+          userId: session.userId,
+          phoneFingerprint,
+        });
+        return {
+          kind: "session",
+          tokens: await tokenPair(session, rawRefresh, at),
+        };
+      } catch (error) {
+        await options.challenges.releaseVerification(challengeId);
+        throw error;
+      }
     },
 
     async refresh(input: { refreshToken: string; context?: RequestContext }) {
@@ -512,7 +592,31 @@ export function createSmsBasedAuth<
           currentSession.scope,
         ))
       ) {
-        await options.sessions.revokeAll(currentSession.userId);
+        await options.sessions.revokeAll(
+          currentSession.scope,
+          currentSession.userId,
+        );
+        throw new AuthError("ACCOUNT_INELIGIBLE", "Session is invalid", 401);
+      }
+      const freshAuthorization = options.identities.reauthorize
+        ? await options.identities.reauthorize({
+            userId: currentSession.userId,
+            scope: currentSession.scope,
+            sessionId: currentSession.id,
+          })
+        : undefined;
+      if (options.identities.reauthorize && !freshAuthorization) {
+        await options.sessions.revokeAll(
+          currentSession.scope,
+          currentSession.userId,
+        );
+        throw new AuthError("ACCOUNT_INELIGIBLE", "Session is invalid", 401);
+      }
+      if (freshAuthorization?.eligible === false) {
+        await options.sessions.revokeAll(
+          currentSession.scope,
+          currentSession.userId,
+        );
         throw new AuthError("ACCOUNT_INELIGIBLE", "Session is invalid", 401);
       }
       await checkRate(
@@ -520,17 +624,47 @@ export function createSmsBasedAuth<
         [
           `session:${sessionId}`,
           ...(input.context?.ip
-            ? [`ip:${keyedHash(pepper, "ip-fingerprint", input.context.ip)}`]
+            ? [
+                `ip:${keyedHash(fingerprintPepper, "ip-fingerprint", input.context.ip)}`,
+              ]
             : []),
         ],
         at,
       );
       const next = randomToken();
+      const currentPepperKid =
+        currentSession.refreshPepperVersion ?? cfg.pepper.kid;
+      const currentPepper = pepperByKid.get(currentPepperKid);
+      if (!currentPepper)
+        throw new AuthError("SESSION_REVOKED", "Session is invalid", 401);
       const result = await options.sessions.rotate(
         sessionId,
-        keyedHash(pepper, `refresh:${cfg.pepper.kid}`, presented),
+        keyedHash(currentPepper, `refresh:${currentPepperKid}`, presented),
         keyedHash(pepper, `refresh:${cfg.pepper.kid}`, next),
         at,
+        {
+          nextPepperVersion: cfg.pepper.kid,
+          presentedHashes: cfg.pepperRing
+            .filter((keyConfig) => keyConfig.kid !== currentPepperKid)
+            .map((keyConfig) =>
+              keyedHash(
+                keyConfig.secret,
+                `refresh:${keyConfig.kid}`,
+                presented,
+              ),
+            ),
+          ...(freshAuthorization
+            ? {
+                authorization: {
+                  roles: freshAuthorization.roles ?? currentSession.roles,
+                  permissions:
+                    freshAuthorization.permissions ??
+                    currentSession.permissions,
+                  claims: freshAuthorization.claims ?? currentSession.claims,
+                },
+              }
+            : {}),
+        },
       );
       if (result.status === "reused") {
         await safelyObserve(options.observer, {
@@ -557,19 +691,27 @@ export function createSmsBasedAuth<
       accessToken: string;
     }): Promise<SessionSummary[]> {
       const actor = await verifyAccessToken(input.accessToken, true);
-      return (await options.sessions.list(actor.userId)).map((session) => ({
-        id: session.id,
-        current: session.id === actor.sessionId,
-        status: session.status,
-        createdAt: session.createdAt,
-        expiresAt: session.expiresAt,
-        lastUsedAt: session.lastUsedAt,
-        ...(session.userAgent ? { userAgent: session.userAgent } : {}),
-      }));
+      return (await options.sessions.list(actor.scope, actor.userId)).map(
+        (session) => ({
+          id: session.id,
+          current: session.id === actor.sessionId,
+          status: session.status,
+          createdAt: session.createdAt,
+          expiresAt: session.expiresAt,
+          lastUsedAt: session.lastUsedAt,
+          ...(session.userAgent ? { userAgent: session.userAgent } : {}),
+        }),
+      );
     },
     async revokeSession(input: { sessionId: string; accessToken: string }) {
       const actor = await verifyAccessToken(input.accessToken, true);
-      if (!(await options.sessions.revokeOwned(input.sessionId, actor.userId)))
+      if (
+        !(await options.sessions.revokeOwned(
+          input.sessionId,
+          actor.scope,
+          actor.userId,
+        ))
+      )
         throw new AuthError(
           "FORBIDDEN",
           "Session does not belong to the actor",
@@ -584,7 +726,13 @@ export function createSmsBasedAuth<
     },
     async logout(input: { accessToken: string }) {
       const actor = await verifyAccessToken(input.accessToken, true);
-      if (!(await options.sessions.revokeOwned(actor.sessionId, actor.userId)))
+      if (
+        !(await options.sessions.revokeOwned(
+          actor.sessionId,
+          actor.scope,
+          actor.userId,
+        ))
+      )
         throw new AuthError("SESSION_REVOKED", "Session is invalid", 401);
       await safelyObserve(options.observer, {
         type: "session.revoked",
@@ -595,7 +743,7 @@ export function createSmsBasedAuth<
     },
     async revokeAllSessions(input: { accessToken: string }) {
       const actor = await verifyAccessToken(input.accessToken, true);
-      const count = await options.sessions.revokeAll(actor.userId);
+      const count = await options.sessions.revokeAll(actor.scope, actor.userId);
       await safelyObserve(options.observer, {
         type: "session.all_revoked",
         occurredAt: now(),

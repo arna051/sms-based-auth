@@ -18,7 +18,16 @@ To rotate access keys:
 4. Wait longer than access-token TTL plus clock tolerance.
 5. Remove the retired verification key.
 
-Pepper rotation requires retaining versioned verification capability for live challenges and sessions or revoking them. The current release records `pepperVersion`; coordinate pepper changes with session revocation/migration.
+To rotate OTP and refresh peppers, deploy the new key as `pepper` and keep old
+keys in `verificationPeppers`. New refresh rotations migrate sessions to the
+active key automatically. Retain every old key through the longest live refresh
+session (or explicitly revoke those sessions), then remove it. Use a separate,
+stable `fingerprintPepper` across rotations so phone/IP/device abuse buckets and
+privacy-preserving metadata remain comparable.
+
+Implement `identities.reauthorize` when authorization may change during a
+refresh session. Its result is written atomically with refresh rotation before
+the new access token is minted.
 
 ## HTTP
 

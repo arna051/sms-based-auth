@@ -6,6 +6,7 @@ import { AuthError } from "../src/errors.js";
 
 const context = {
   userId: "u1",
+  scope: "tenant",
   sessionId: "s1",
   roles: ["admin"],
   permissions: ["orders.read"],
@@ -13,11 +14,19 @@ const context = {
   issuedAt: new Date(),
   expiresAt: new Date(Date.now() + 1000),
 };
-function appFor(verifier: (token: string) => Promise<typeof context>) {
+function appFor(
+  verifier: (token: string) => Promise<typeof context>,
+  headerName?: string,
+) {
   const app = express();
   const adapter = createExpressAuth(
     { verifyAccessToken: verifier },
-    { csrf: { expectedOrigin: "https://app.test" } },
+    {
+      csrf: {
+        expectedOrigin: "https://app.test",
+        ...(headerName ? { headerName } : {}),
+      },
+    },
   );
   app.get("/profile", adapter.requireAuth(), (_req, res) =>
     res.json({ ok: true }),
@@ -83,5 +92,11 @@ describe("Express adapter", () => {
       .set("Cookie", "__Host-sba_csrf=abc")
       .set("x-csrf-token", "abc")
       .expect(403);
+    await request(appFor(async () => context, "X-CSRF-Token"))
+      .post("/state")
+      .set("Origin", "https://app.test")
+      .set("Cookie", "__Host-sba_csrf=abc")
+      .set("x-csrf-token", "abc")
+      .expect(200);
   });
 });

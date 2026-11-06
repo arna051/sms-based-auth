@@ -4,6 +4,11 @@ All notable changes follow Keep a Changelog. The project uses Semantic Versionin
 
 ## [Unreleased]
 
+- Added tenant-bound access contexts and tenant-isolated session administration.
+- Added retry-safe OTP verification leases and downstream failure recovery.
+- Added versioned OTP/refresh pepper rotation and refresh-time authorization reloads.
+- Added NestJS cookie/hybrid transport, CSRF enforcement, and problem responses.
+
 ### Added
 
 - Security-first OTP, session rotation, transport, framework, Mongoose, Redis, Edge, audit-observer, packaging, CI, and integration-test foundations.

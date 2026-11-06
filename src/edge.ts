@@ -42,6 +42,11 @@ export function createEdgeVerifier(
     const key = keys.get(header.kid);
     if (!key) throw new Error("Unknown key");
     if (header.alg !== key.algorithm) throw new Error("Algorithm mismatch");
+    if (
+      key.publicKey.type !== "public" ||
+      !key.publicKey.usages.includes("verify")
+    )
+      throw new Error("A public verification key is required");
     const result = await jwtVerify(token, key.publicKey, {
       algorithms: [key.algorithm],
       issuer: options.issuer,

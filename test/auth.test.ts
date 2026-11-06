@@ -9,7 +9,13 @@ import {
 
 const secret = new Uint8Array(32).fill(7);
 const scope = "tenant-a";
-function fixture(options: { clock?: () => Date; rateLimit?: number } = {}) {
+function fixture(
+  options: {
+    clock?: () => Date;
+    rateLimit?: number;
+    identityFailures?: number;
+  } = {},
+) {
   let code = "";
   const sessions = new MemorySessionStore();
   const events: string[] = [];
@@ -37,10 +43,14 @@ function fixture(options: { clock?: () => Date; rateLimit?: number } = {}) {
     },
     identities: {
       async resolve() {
+        if ((options.identityFailures ?? 0) > 0) {
+          options.identityFailures!--;
+          throw new Error("identity store unavailable");
+        }
         return { userId: "u1", roles: ["user"], claims: { plan: "pro" } };
       },
     },
-    authorizeScope: async (candidate) => candidate === scope,
+    authorizeScope: async (candidate) => candidate.startsWith("tenant-"),
     observer: {
       emit(event) {
         events.push(event.type);
@@ -50,13 +60,17 @@ function fixture(options: { clock?: () => Date; rateLimit?: number } = {}) {
   });
   return { auth, sessions, events, getCode: () => code };
 }
-async function login(f: ReturnType<typeof fixture>) {
-  await f.auth.requestCode({ phone: "09123456789", purpose: "login", scope });
+async function login(f: ReturnType<typeof fixture>, loginScope = scope) {
+  await f.auth.requestCode({
+    phone: "09123456789",
+    purpose: "login",
+    scope: loginScope,
+  });
   const result = await f.auth.verifyCode({
     phone: "09123456789",
     purpose: "login",
     code: f.getCode(),
-    scope,
+    scope: loginScope,
   });
   if (result.kind !== "session") throw new Error("expected a session");
   return result.tokens;
@@ -98,6 +112,22 @@ describe("challenge security", () => {
       f.auth.requestCode({ phone: "09123456789", purpose: "login", scope }),
     ).rejects.toMatchObject({ code: "CHALLENGE_COOLDOWN" });
   });
+  it("releases a correct OTP when downstream identity resolution fails", async () => {
+    const f = fixture({ identityFailures: 1 });
+    await f.auth.requestCode({ phone: "09123456789", purpose: "login", scope });
+    const input = {
+      phone: "09123456789",
+      purpose: "login" as const,
+      code: f.getCode(),
+      scope,
+    };
+    await expect(f.auth.verifyCode(input)).rejects.toThrow(
+      "identity store unavailable",
+    );
+    await expect(f.auth.verifyCode(input)).resolves.toMatchObject({
+      kind: "session",
+    });
+  });
   it("requires actor binding for sensitive purposes", async () => {
     const f = fixture();
     await expect(
@@ -108,6 +138,14 @@ describe("challenge security", () => {
       }),
     ).rejects.toMatchObject({ code: "INVALID_INPUT" });
     const actor = await login(f);
+    await expect(
+      f.auth.requestCode({
+        phone: "09123456789",
+        purpose: "sensitive_action",
+        scope: "tenant-b",
+        actorAccessToken: actor.accessToken,
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
     await f.auth.requestCode({
       phone: "09123456789",
       purpose: "sensitive_action",
@@ -129,9 +167,19 @@ describe("challenge security", () => {
   });
   it("rate limits abuse buckets", async () => {
     const f = fixture({ rateLimit: 1 });
-    await f.auth.requestCode({ phone: "09123456789", purpose: "login", scope });
+    await f.auth.requestCode({
+      phone: "09123456789",
+      purpose: "login",
+      scope,
+      context: { ip: "203.0.113.10" },
+    });
     await expect(
-      f.auth.requestCode({ phone: "09123456780", purpose: "login", scope }),
+      f.auth.requestCode({
+        phone: "09123456780",
+        purpose: "login",
+        scope,
+        context: { ip: "203.0.113.10" },
+      }),
     ).rejects.toMatchObject({ code: "RATE_LIMITED" });
   });
 });
@@ -177,6 +225,178 @@ describe("session and token security", () => {
     });
     expect(sessions[0]).not.toHaveProperty("refreshHash");
     expect(sessions[0]?.current).toBe(true);
+  });
+  it("isolates session administration by tenant scope", async () => {
+    const f = fixture();
+    const tenantA = await login(f, "tenant-a");
+    const tenantB = await login(f, "tenant-b");
+    const contextB = await f.auth.verifyAccessToken(tenantB.accessToken);
+    await expect(
+      f.auth.revokeSession({
+        accessToken: tenantA.accessToken,
+        sessionId: contextB.sessionId,
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(
+      await f.auth.listSessions({ accessToken: tenantA.accessToken }),
+    ).toHaveLength(1);
+    expect(
+      await f.auth.listSessions({ accessToken: tenantB.accessToken }),
+    ).toHaveLength(1);
+  });
+  it("retains old peppers for live OTPs and refreshes, then migrates sessions", async () => {
+    const oldSecret = new Uint8Array(32).fill(11);
+    const newSecret = new Uint8Array(32).fill(12);
+    const challenges = new MemoryChallengeStore();
+    const sessions = new MemorySessionStore();
+    let code = "";
+    const build = (
+      pepper: {
+        kid: string;
+        algorithm: "HS256";
+        secret: Uint8Array<ArrayBuffer>;
+      },
+      verificationPeppers: Array<{
+        kid: string;
+        algorithm: "HS256";
+        secret: Uint8Array<ArrayBuffer>;
+      }> = [],
+    ) =>
+      createSmsBasedAuth({
+        config: {
+          issuer: "test",
+          audience: "test",
+          accessTokenKeys: [{ kid: "access-1", algorithm: "HS256", secret }],
+          activeAccessTokenKid: "access-1",
+          pepper,
+          verificationPeppers,
+          ...(verificationPeppers.length > 0
+            ? {
+                fingerprintPepper: {
+                  kid: "fingerprint",
+                  algorithm: "HS256" as const,
+                  secret: oldSecret,
+                },
+              }
+            : {}),
+        },
+        challenges,
+        sessions,
+        rateLimiter: new MemoryRateLimiter({ limit: 100 }),
+        sms: {
+          async send(_action, variables) {
+            code = variables.code;
+          },
+        },
+        smsActions: {
+          login: "login",
+          phone_verification: "verify",
+          account_recovery: "recover",
+          sensitive_action: "sensitive",
+        },
+        identities: {
+          async resolve() {
+            return { userId: "u1" };
+          },
+        },
+        authorizeScope: async () => true,
+      });
+    const oldAuth = build({
+      kid: "old",
+      algorithm: "HS256",
+      secret: oldSecret,
+    });
+    await oldAuth.requestCode({
+      phone: "09123456789",
+      purpose: "login",
+      scope,
+    });
+    const newAuth = build(
+      { kid: "new", algorithm: "HS256", secret: newSecret },
+      [{ kid: "old", algorithm: "HS256", secret: oldSecret }],
+    );
+    await expect(
+      newAuth.verifyCode({
+        phone: "09123456789",
+        purpose: "login",
+        code,
+        scope,
+      }),
+    ).resolves.toMatchObject({ kind: "session" });
+
+    await oldAuth.requestCode({
+      phone: "09123456780",
+      purpose: "login",
+      scope,
+    });
+    const oldLogin = await oldAuth.verifyCode({
+      phone: "09123456780",
+      purpose: "login",
+      code,
+      scope,
+    });
+    if (oldLogin.kind !== "session") throw new Error("expected session");
+    const rotated = await newAuth.refresh({
+      refreshToken: oldLogin.tokens.refreshToken,
+    });
+    expect(await sessions.get(rotated.sessionId)).toMatchObject({
+      refreshPepperVersion: "new",
+    });
+    await expect(
+      newAuth.refresh({ refreshToken: oldLogin.tokens.refreshToken }),
+    ).rejects.toMatchObject({ code: "TOKEN_REUSE" });
+  });
+
+  it("refreshes authorization claims from the identity provider", async () => {
+    let roles = ["user"];
+    let code = "";
+    const auth = createSmsBasedAuth({
+      config: {
+        issuer: "test",
+        audience: "test",
+        accessTokenKeys: [{ kid: "access-1", algorithm: "HS256", secret }],
+        activeAccessTokenKid: "access-1",
+        pepper: { kid: "pepper-1", algorithm: "HS256", secret },
+      },
+      challenges: new MemoryChallengeStore(),
+      sessions: new MemorySessionStore(),
+      rateLimiter: new MemoryRateLimiter({ limit: 100 }),
+      sms: {
+        async send(_action, variables) {
+          code = variables.code;
+        },
+      },
+      smsActions: {
+        login: "login",
+        phone_verification: "verify",
+        account_recovery: "recover",
+        sensitive_action: "sensitive",
+      },
+      identities: {
+        async resolve() {
+          return { userId: "u1", roles };
+        },
+        async reauthorize() {
+          return { roles };
+        },
+      },
+      authorizeScope: async () => true,
+    });
+    await auth.requestCode({ phone: "09123456789", purpose: "login", scope });
+    const loggedIn = await auth.verifyCode({
+      phone: "09123456789",
+      purpose: "login",
+      code,
+      scope,
+    });
+    if (loggedIn.kind !== "session") throw new Error("expected session");
+    roles = ["admin"];
+    const refreshed = await auth.refresh({
+      refreshToken: loggedIn.tokens.refreshToken,
+    });
+    expect((await auth.verifyAccessToken(refreshed.accessToken)).roles).toEqual(
+      ["admin"],
+    );
   });
   it("prevents cross-user session revocation", async () => {
     const f = fixture();

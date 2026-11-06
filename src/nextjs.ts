@@ -21,7 +21,11 @@ export function withAuth<T extends Record<string, unknown>>(
 ) {
   return async (
     request: Request,
-    routeContext: { params?: Record<string, string | string[]> } = {},
+    routeContext: {
+      params?:
+        | Record<string, string | string[]>
+        | Promise<Record<string, string | string[]>>;
+    } = {},
   ) => {
     const bearer = request.headers
       .get("authorization")
@@ -44,7 +48,7 @@ export function withAuth<T extends Record<string, unknown>>(
       );
       return await handler(request, {
         auth: context,
-        ...(routeContext.params ? { params: routeContext.params } : {}),
+        ...(routeContext.params ? { params: await routeContext.params } : {}),
       });
     } catch (error) {
       if (error instanceof AuthError)

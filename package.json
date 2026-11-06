@@ -17,7 +17,10 @@
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "sideEffects": false,
+  "sideEffects": [
+    "./dist/nestjs.js",
+    "./dist/nestjs.cjs"
+  ],
   "exports": {
     ".": {
       "import": {
@@ -134,11 +137,11 @@
     "format": "prettier --write . --ignore-path .gitignore",
     "edge:check": "vitest run test/edge-bundle.test.ts",
     "test:integration": "INTEGRATION=1 vitest run test/integration.test.ts",
-    "integration:up": "docker compose -f docker-compose.integration.yml up -d --wait",
+    "integration:up": "docker compose -f docker-compose.integration.yml up -d --wait mongo redis && docker compose -f docker-compose.integration.yml run --rm mongo-init",
     "integration:down": "docker compose -f docker-compose.integration.yml down -v",
     "package:check": "npm run build && node scripts/verify-package.mjs",
     "check": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run build",
-    "prepublishOnly": "npm run check"
+    "prepublishOnly": "npm run check && npm run package:check"
   },
   "keywords": [
     "authentication",

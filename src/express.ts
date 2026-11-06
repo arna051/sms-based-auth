@@ -77,7 +77,7 @@ export function createExpressAuth<T extends Record<string, unknown>>(
   const requireCsrf = (): RequestHandler => (req, res, next) => {
     try {
       if (!options.csrf) throw new Error("CSRF options are required");
-      const header = req.headers[options.csrf.headerName ?? "x-csrf-token"];
+      const header = req.get(options.csrf.headerName ?? "x-csrf-token");
       const csrfCookie = parseCookie(
         req.headers.cookie,
         options.csrf.cookieName ?? "__Host-sba_csrf",
@@ -86,13 +86,7 @@ export function createExpressAuth<T extends Record<string, unknown>>(
         expectedOrigin: options.csrf.expectedOrigin,
         ...(req.headers.origin ? { origin: req.headers.origin } : {}),
         ...(csrfCookie ? { csrfCookie } : {}),
-        ...(Array.isArray(header)
-          ? header[0]
-            ? { csrfHeader: header[0] }
-            : {}
-          : header
-            ? { csrfHeader: header }
-            : {}),
+        ...(header ? { csrfHeader: header } : {}),
       });
       next();
     } catch {

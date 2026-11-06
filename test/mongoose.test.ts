@@ -14,7 +14,7 @@ describe("Mongoose schema contracts", () => {
       ([keys, options]) => keys.key === 1 && options.unique,
     );
     expect(activeIndex?.[1].partialFilterExpression).toEqual({
-      state: { $in: ["dispatching", "active"] },
+      state: { $in: ["dispatching", "active", "verifying"] },
     });
     const expiresIndexes = challengeIndexes.filter(
       ([keys]) => keys.expiresAt === 1,
@@ -26,6 +26,14 @@ describe("Mongoose schema contracts", () => {
         .some(
           ([keys, options]) =>
             keys.expiresAt === 1 && options.expireAfterSeconds === 0,
+        ),
+    ).toBe(true);
+    expect(
+      Session.schema
+        .indexes()
+        .some(
+          ([keys]) =>
+            keys.scope === 1 && keys.userId === 1 && keys.status === 1,
         ),
     ).toBe(true);
   });
